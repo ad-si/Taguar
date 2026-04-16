@@ -5,7 +5,7 @@ use iced::widget::{
   text_input, Column, Space,
 };
 use iced::{
-  Alignment, Background, Border, Color, Element, Length, Task, Theme,
+  Alignment, Background, Border, Color, Element, Font, Length, Task, Theme,
 };
 use lofty::config::WriteOptions;
 use lofty::file::TaggedFileExt;
@@ -33,6 +33,18 @@ const PANEL_BG: Color = Color::from_rgb(0.98, 0.98, 0.99);
 const HEADER_BG: Color = Color::from_rgb(0.94, 0.94, 0.96);
 const MUTED: Color = Color::from_rgb(0.40, 0.40, 0.44);
 
+const FONT_REGULAR_BYTES: &[u8] =
+  include_bytes!("../fonts/FiraSans-Regular.ttf");
+const FONT_BOLD_BYTES: &[u8] = include_bytes!("../fonts/FiraSans-Bold.ttf");
+
+const APP_FONT: Font = Font::with_name("Fira Sans");
+const BOLD: Font = Font {
+  family: iced::font::Family::Name("Fira Sans"),
+  weight: iced::font::Weight::Bold,
+  stretch: iced::font::Stretch::Normal,
+  style: iced::font::Style::Normal,
+};
+
 pub fn main() -> iced::Result {
   let arg_dir = std::env::args().nth(1).map(|arg| {
     if arg == "-h" || arg == "--help" {
@@ -50,6 +62,9 @@ pub fn main() -> iced::Result {
   iced::application("Taguar", Taguar::update, Taguar::view)
     .theme(|_| Theme::Light)
     .window_size((1200.0, 760.0))
+    .font(FONT_REGULAR_BYTES)
+    .font(FONT_BOLD_BYTES)
+    .default_font(APP_FONT)
     .run_with(move || {
       let state = Taguar::default();
       let task = match arg_dir {
@@ -128,6 +143,7 @@ struct CoverInfo {
 enum Message {
   SelectDirectory,
   DirectoryChosen(Option<PathBuf>),
+  Reload,
   FilesLoaded(Vec<FileInfo>),
   FileSelected(usize),
   TitleChanged(String),
@@ -182,6 +198,32 @@ impl Taguar {
         )
       }
       Message::DirectoryChosen(None) => Task::none(),
+      Message::Reload => {
+        if let Some(dir) = self.directory.clone() {
+          playback_send(PlaybackCmd::Stop);
+          self.playing_path = None;
+          self.is_paused = false;
+          self.files.clear();
+          self.selected_idx = None;
+          self.form = TagForm::default();
+          self.id3v1 = None;
+          self.cover = None;
+          self.primary_tag_label.clear();
+          self.loading = true;
+          self.status = Some("Reloading...".to_string());
+          Task::perform(
+            async move {
+              tokio::task::spawn_blocking(move || scan_and_load(&dir))
+                .await
+                .unwrap_or_default()
+            },
+            Message::FilesLoaded,
+          )
+        }
+        else {
+          Task::none()
+        }
+      }
       Message::FilesLoaded(files) => {
         self.files = files;
         self.loading = false;
@@ -363,9 +405,12 @@ impl Taguar {
 
     container(
       row![
-        text(dir).size(12).color(MUTED).width(Length::Fill),
         button(text("Change Directory").size(12))
           .on_press(Message::SelectDirectory)
+          .padding([4, 10]),
+        text(dir).size(12).font(BOLD).width(Length::Fill),
+        button(text("Reload").size(12))
+          .on_press(Message::Reload)
           .padding([4, 10]),
       ]
       .spacing(10)
@@ -389,6 +434,7 @@ impl Taguar {
       .map(|(label, w)| {
         text(*label)
           .size(12)
+          .font(BOLD)
           .width(Length::FillPortion(*w))
           .color(MUTED)
           .into()
