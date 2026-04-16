@@ -173,6 +173,7 @@ enum Message {
   CoverReplace,
   CoverReplaceChosen(Option<PathBuf>),
   CoverDelete,
+  CommentOpenUrl(String),
 }
 
 /// Describes a change to the embedded cover picture to apply during a save.
@@ -387,6 +388,10 @@ impl Taguar {
       }
       Message::CoverDelete => {
         self.spawn_save(PictureChange::Delete, "Deleting cover...")
+      }
+      Message::CommentOpenUrl(url) => {
+        open_url(&url);
+        Task::none()
       }
     }
   }
@@ -693,8 +698,28 @@ impl Taguar {
         Message::ReleaseDateChanged,
       ));
     }
+    let comment_input = text_input("", &form.comment)
+      .on_input(Message::CommentChanged)
+      .size(12)
+      .padding(4);
+    let comment_row: Element<Message> =
+      if let Some(url) = first_url(&form.comment) {
+        row![
+          comment_input,
+          button(text("\u{1F310}").size(12))
+            .on_press(Message::CommentOpenUrl(url))
+            .padding([4, 8]),
+        ]
+        .spacing(4)
+        .align_y(Alignment::Center)
+        .into()
+      }
+      else {
+        comment_input.into()
+      };
+    let comment_field = column![label("Comment:"), comment_row].spacing(2);
     content = content
-      .push(field("Comment:", &form.comment, Message::CommentChanged))
+      .push(comment_field)
       .push(field(
         "Album Artist:",
         &form.album_artist,
@@ -973,6 +998,53 @@ fn primary_button_style(
 }
 
 // ───── IO / Tag utilities ─────────────────────────────────────────────────
+
+/// Returns the first `http://` or `https://` URL found in `s`, trimmed of
+/// common trailing punctuation, or `None` if no URL is present.
+fn first_url(s: &str) -> Option<String> {
+  let http = s.find("http://");
+  let https = s.find("https://");
+  let start = match (http, https) {
+    (Some(a), Some(b)) => a.min(b),
+    (Some(a), None) => a,
+    (None, Some(b)) => b,
+    (None, None) => return None,
+  };
+  let rest = &s[start..];
+  let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+  let mut url = rest[..end].to_string();
+  while let Some(last) = url.chars().last() {
+    if matches!(
+      last,
+      '.' | ',' | ')' | ']' | '}' | '!' | '?' | ';' | ':' | '>' | '"' | '\''
+    ) {
+      url.pop();
+    }
+    else {
+      break;
+    }
+  }
+  // Require something beyond the scheme.
+  let scheme_len = if url.starts_with("https://") { 8 } else { 7 };
+  if url.len() > scheme_len {
+    Some(url)
+  }
+  else {
+    None
+  }
+}
+
+/// Opens `url` in the user's default browser on the host platform.
+fn open_url(url: &str) {
+  #[cfg(target_os = "macos")]
+  let _ = std::process::Command::new("open").arg(url).spawn();
+  #[cfg(target_os = "linux")]
+  let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+  #[cfg(target_os = "windows")]
+  let _ = std::process::Command::new("cmd")
+    .args(["/C", "start", "", url])
+    .spawn();
+}
 
 fn format_duration(secs: u64) -> String {
   let h = secs / 3600;
