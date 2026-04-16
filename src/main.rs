@@ -11,6 +11,7 @@ use lofty::config::WriteOptions;
 use lofty::file::TaggedFileExt;
 use lofty::picture::PictureType;
 use lofty::prelude::{Accessor, AudioFile, ItemKey, TagExt};
+use lofty::tag::items::Timestamp;
 use lofty::tag::{Tag, TagType};
 use std::fs::File;
 use std::io::BufReader;
@@ -59,20 +60,25 @@ pub fn main() -> iced::Result {
     path.canonicalize().unwrap_or(path)
   });
 
-  iced::application("Taguar", Taguar::update, Taguar::view)
-    .theme(|_| Theme::Light)
-    .window_size((1200.0, 760.0))
-    .font(FONT_REGULAR_BYTES)
-    .font(FONT_BOLD_BYTES)
-    .default_font(APP_FONT)
-    .run_with(move || {
+  iced::application(
+    move || {
       let state = Taguar::default();
-      let task = match arg_dir {
+      let task = match arg_dir.clone() {
         Some(dir) => Task::done(Message::DirectoryChosen(Some(dir))),
         None => Task::none(),
       };
       (state, task)
-    })
+    },
+    Taguar::update,
+    Taguar::view,
+  )
+  .title("Taguar")
+  .theme(Theme::Light)
+  .window_size((1200.0, 760.0))
+  .font(FONT_REGULAR_BYTES)
+  .font(FONT_BOLD_BYTES)
+  .default_font(APP_FONT)
+  .run()
 }
 
 #[derive(Default)]
@@ -565,8 +571,9 @@ impl Taguar {
       ]
       .spacing(2),
       column![
-        Space::with_height(14),
-        checkbox("Compilation", form.compilation)
+        Space::new().height(14),
+        checkbox(form.compilation)
+          .label("Compilation")
           .on_toggle(Message::CompilationToggled)
           .size(13)
           .text_size(12),
@@ -629,7 +636,7 @@ impl Taguar {
       ))
       .push(field("Composer:", &form.composer, Message::ComposerChanged))
       .push(disc_comp)
-      .push(Space::with_height(6))
+      .push(Space::new().height(6))
       .push(save_row);
 
     if !self.primary_tag_label.is_empty() {
@@ -642,7 +649,7 @@ impl Taguar {
 
     // Cover
     if let Some(cov) = &self.cover {
-      content = content.push(Space::with_height(8));
+      content = content.push(Space::new().height(8));
       content = content.push(
         container(
           image(cov.handle.clone())
@@ -673,7 +680,7 @@ impl Taguar {
 
     // ID3v1 read-only
     if let Some(v1) = &self.id3v1 {
-      content = content.push(Space::with_height(10));
+      content = content.push(Space::new().height(10));
       content = content.push(text("ID3v1 (read-only)").size(11).color(MUTED));
       let v1_row = |lbl: &'static str, val: &str| -> Element<Message> {
         row![
@@ -1007,7 +1014,7 @@ fn load_full(
       title: tag.title().map(|s| s.to_string()).unwrap_or_default(),
       artist: tag.artist().map(|s| s.to_string()).unwrap_or_default(),
       album: tag.album().map(|s| s.to_string()).unwrap_or_default(),
-      year: tag.year().map(|y| y.to_string()).unwrap_or_default(),
+      year: tag.date().map(|d| d.year.to_string()).unwrap_or_default(),
       comment: tag.comment().map(|s| s.to_string()).unwrap_or_default(),
       track: tag.track().map(|t| t.to_string()).unwrap_or_default(),
       genre: tag.genre().map(|s| s.to_string()).unwrap_or_default(),
@@ -1020,10 +1027,10 @@ fn load_full(
     form.artist = tag.artist().map(|s| s.to_string()).unwrap_or_default();
     form.album = tag.album().map(|s| s.to_string()).unwrap_or_default();
     form.album_artist = tag
-      .get_string(&ItemKey::AlbumArtist)
+      .get_string(ItemKey::AlbumArtist)
       .map(|s| s.to_string())
       .unwrap_or_default();
-    form.year = tag.year().map(|y| y.to_string()).unwrap_or_default();
+    form.year = tag.date().map(|d| d.year.to_string()).unwrap_or_default();
     form.track = tag.track().map(|t| t.to_string()).unwrap_or_default();
     form.track_total =
       tag.track_total().map(|t| t.to_string()).unwrap_or_default();
@@ -1033,11 +1040,11 @@ fn load_full(
     form.genre = tag.genre().map(|s| s.to_string()).unwrap_or_default();
     form.comment = tag.comment().map(|s| s.to_string()).unwrap_or_default();
     form.composer = tag
-      .get_string(&ItemKey::Composer)
+      .get_string(ItemKey::Composer)
       .map(|s| s.to_string())
       .unwrap_or_default();
     form.compilation = tag
-      .get_string(&ItemKey::FlagCompilation)
+      .get_string(ItemKey::FlagCompilation)
       .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
       .unwrap_or(false);
 
@@ -1154,14 +1161,14 @@ fn save_tags(path: &Path, form: &TagForm) -> Result<(), String> {
   });
 
   if form.album_artist.is_empty() {
-    tag.remove_key(&ItemKey::AlbumArtist);
+    tag.remove_key(ItemKey::AlbumArtist);
   }
   else {
     tag.insert_text(ItemKey::AlbumArtist, form.album_artist.clone());
   }
 
   if form.composer.is_empty() {
-    tag.remove_key(&ItemKey::Composer);
+    tag.remove_key(ItemKey::Composer);
   }
   else {
     tag.insert_text(ItemKey::Composer, form.composer.clone());
@@ -1171,16 +1178,10 @@ fn save_tags(path: &Path, form: &TagForm) -> Result<(), String> {
     tag.insert_text(ItemKey::FlagCompilation, "1".to_string());
   }
   else {
-    tag.remove_key(&ItemKey::FlagCompilation);
+    tag.remove_key(ItemKey::FlagCompilation);
   }
 
-  set_or_remove_u32(
-    &mut tag,
-    &form.year,
-    "year",
-    |t| t.remove_year(),
-    |t, v| t.set_year(v),
-  )?;
+  set_or_remove_year(&mut tag, &form.year)?;
   set_or_remove_u32(
     &mut tag,
     &form.track,
@@ -1224,10 +1225,29 @@ fn set_or_remove_string(
   setter: impl FnOnce(&mut Tag, String),
 ) {
   if value.is_empty() {
-    tag.remove_key(&key);
+    tag.remove_key(key);
   }
   else {
     setter(tag, value.to_string());
+  }
+}
+
+fn set_or_remove_year(tag: &mut Tag, value: &str) -> Result<(), String> {
+  if value.trim().is_empty() {
+    tag.remove_date();
+    Ok(())
+  }
+  else {
+    match value.trim().parse::<u16>() {
+      Ok(year) => {
+        tag.set_date(Timestamp {
+          year,
+          ..Timestamp::default()
+        });
+        Ok(())
+      }
+      Err(_) => Err(format!("Invalid year: '{value}'")),
+    }
   }
 }
 
@@ -1293,83 +1313,80 @@ fn playback_send(cmd: PlaybackCmd) {
 }
 
 fn playback_worker(rx: mpsc::Receiver<PlaybackCmd>) {
-  let (_stream, handle) = match rodio::OutputStream::try_default() {
+  let device_sink = match rodio::DeviceSinkBuilder::open_default_sink() {
     Ok(s) => s,
     Err(_) => return,
   };
-  let mut sink: Option<rodio::Sink> = None;
+  let mixer = device_sink.mixer();
+  let mut player: Option<rodio::Player> = None;
 
   while let Ok(cmd) = rx.recv() {
     match cmd {
       PlaybackCmd::Play(path) => {
-        if let Some(s) = sink.take() {
-          s.stop();
+        if let Some(p) = player.take() {
+          p.stop();
         }
-        match rodio::Sink::try_new(&handle) {
-          Ok(new_sink) => {
-            let is_opus = path
-              .extension()
-              .and_then(|e| e.to_str())
-              .map(|s| s.eq_ignore_ascii_case("opus"))
-              .unwrap_or(false);
+        let new_player = rodio::Player::connect_new(mixer);
+        let is_opus = path
+          .extension()
+          .and_then(|e| e.to_str())
+          .map(|s| s.eq_ignore_ascii_case("opus"))
+          .unwrap_or(false);
 
-            let result = if is_opus {
-              match OpusSource::open(&path) {
-                Ok(src) => {
-                  new_sink.append(src);
+        let result = if is_opus {
+          match OpusSource::open(&path) {
+            Ok(src) => {
+              new_player.append(src);
+              Ok(())
+            }
+            Err(e) => Err(e),
+          }
+        }
+        else {
+          match File::open(&path) {
+            Ok(file) => {
+              let reader = BufReader::new(file);
+              let decoder_result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                  rodio::Decoder::new(reader)
+                }));
+              match decoder_result {
+                Ok(Ok(decoder)) => {
+                  new_player.append(decoder);
                   Ok(())
                 }
-                Err(e) => Err(e),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err(format!(
+                  "decoder panicked (unsupported / malformed): {}",
+                  path.display()
+                )),
               }
             }
-            else {
-              match File::open(&path) {
-                Ok(file) => {
-                  let reader = BufReader::new(file);
-                  let decoder_result =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                      || rodio::Decoder::new(reader),
-                    ));
-                  match decoder_result {
-                    Ok(Ok(decoder)) => {
-                      new_sink.append(decoder);
-                      Ok(())
-                    }
-                    Ok(Err(e)) => Err(e.to_string()),
-                    Err(_) => Err(format!(
-                      "decoder panicked (unsupported / malformed): {}",
-                      path.display()
-                    )),
-                  }
-                }
-                Err(e) => Err(e.to_string()),
-              }
-            };
-
-            match result {
-              Ok(()) => {
-                new_sink.play();
-                sink = Some(new_sink);
-              }
-              Err(e) => eprintln!("play error: {e}"),
-            }
+            Err(e) => Err(e.to_string()),
           }
-          Err(e) => eprintln!("sink error: {e}"),
+        };
+
+        match result {
+          Ok(()) => {
+            new_player.play();
+            player = Some(new_player);
+          }
+          Err(e) => eprintln!("play error: {e}"),
         }
       }
       PlaybackCmd::Pause => {
-        if let Some(s) = &sink {
-          s.pause();
+        if let Some(p) = &player {
+          p.pause();
         }
       }
       PlaybackCmd::Resume => {
-        if let Some(s) = &sink {
-          s.play();
+        if let Some(p) = &player {
+          p.play();
         }
       }
       PlaybackCmd::Stop => {
-        if let Some(s) = sink.take() {
-          s.stop();
+        if let Some(p) = player.take() {
+          p.stop();
         }
       }
     }
@@ -1383,7 +1400,7 @@ fn playback_worker(rx: mpsc::Receiver<PlaybackCmd>) {
 struct OpusSource {
   reader: ogg::PacketReader<BufReader<File>>,
   decoder: opus::Decoder,
-  channels: u16,
+  channels: rodio::ChannelCount,
   pre_skip_remaining: u64,
   samples: Vec<f32>,
   sample_pos: usize,
@@ -1406,8 +1423,11 @@ impl OpusSource {
     let pre_skip = u16::from_le_bytes([head.data[10], head.data[11]]) as u64;
 
     let (ch_enum, ch_num) = match channel_count {
-      1 => (opus::Channels::Mono, 1u16),
-      2 => (opus::Channels::Stereo, 2u16),
+      1 => (opus::Channels::Mono, std::num::NonZeroU16::new(1).unwrap()),
+      2 => (
+        opus::Channels::Stereo,
+        std::num::NonZeroU16::new(2).unwrap(),
+      ),
       n => return Err(format!("unsupported channel count: {n}")),
     };
 
@@ -1455,7 +1475,7 @@ impl OpusSource {
       }
 
       let mut buf =
-        vec![0.0f32; MAX_SAMPLES_PER_CHANNEL * self.channels as usize];
+        vec![0.0f32; MAX_SAMPLES_PER_CHANNEL * self.channels.get() as usize];
       let decoded =
         match self.decoder.decode_float(&packet.data, &mut buf, false) {
           Ok(n) => n,
@@ -1464,12 +1484,12 @@ impl OpusSource {
             continue;
           }
         };
-      buf.truncate(decoded * self.channels as usize);
+      buf.truncate(decoded * self.channels.get() as usize);
 
       // Discard pre-skip samples from the start of the stream.
       if self.pre_skip_remaining > 0 {
         let skip_frames = (self.pre_skip_remaining as usize).min(decoded);
-        let skip_samples = skip_frames * self.channels as usize;
+        let skip_samples = skip_frames * self.channels.get() as usize;
         self.pre_skip_remaining -= skip_frames as u64;
         if skip_samples >= buf.len() {
           continue;
@@ -1501,14 +1521,14 @@ impl Iterator for OpusSource {
 }
 
 impl rodio::Source for OpusSource {
-  fn current_frame_len(&self) -> Option<usize> {
+  fn current_span_len(&self) -> Option<usize> {
     None
   }
-  fn channels(&self) -> u16 {
+  fn channels(&self) -> rodio::ChannelCount {
     self.channels
   }
-  fn sample_rate(&self) -> u32 {
-    48_000
+  fn sample_rate(&self) -> rodio::SampleRate {
+    std::num::NonZeroU32::new(48_000).unwrap()
   }
   fn total_duration(&self) -> Option<std::time::Duration> {
     None
