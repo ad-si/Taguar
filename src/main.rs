@@ -113,7 +113,10 @@ struct TagForm {
   artist: String,
   album: String,
   album_artist: String,
-  year: String,
+  date: String,
+  // Some(_) only when the file's TDRC and TDRL differ; a second input then
+  // appears in the form so both values can be edited independently.
+  release_date: Option<String>,
   track: String,
   track_total: String,
   disc: String,
@@ -156,7 +159,8 @@ enum Message {
   ArtistChanged(String),
   AlbumChanged(String),
   AlbumArtistChanged(String),
-  YearChanged(String),
+  DateChanged(String),
+  ReleaseDateChanged(String),
   TrackChanged(String),
   DiscChanged(String),
   GenreChanged(String),
@@ -264,8 +268,12 @@ impl Taguar {
         self.form.album_artist = v;
         Task::none()
       }
-      Message::YearChanged(v) => {
-        self.form.year = v;
+      Message::DateChanged(v) => {
+        self.form.date = v;
+        Task::none()
+      }
+      Message::ReleaseDateChanged(v) => {
+        self.form.release_date = Some(v);
         Task::none()
       }
       Message::TrackChanged(v) => {
@@ -530,14 +538,20 @@ impl Taguar {
       .into()
     };
 
+    let date_label = if form.release_date.is_some() {
+      "Recording Date (TDRC):"
+    }
+    else {
+      "Release Date:"
+    };
     let year_track_genre = row![
       column![
-        label("Year:"),
-        text_input("", &form.year)
-          .on_input(Message::YearChanged)
+        label(date_label),
+        text_input("YYYY[-MM[-DD]]", &form.date)
+          .on_input(Message::DateChanged)
           .size(12)
           .padding(4)
-          .width(Length::Fixed(60.0)),
+          .width(Length::Fixed(110.0)),
       ]
       .spacing(2),
       column![
@@ -627,7 +641,15 @@ impl Taguar {
       .push(field("Title:", &form.title, Message::TitleChanged))
       .push(field("Artist:", &form.artist, Message::ArtistChanged))
       .push(field("Album:", &form.album, Message::AlbumChanged))
-      .push(year_track_genre)
+      .push(year_track_genre);
+    if let Some(rd) = &form.release_date {
+      content = content.push(field(
+        "Release Date (TDRL):",
+        rd,
+        Message::ReleaseDateChanged,
+      ));
+    }
+    content = content
       .push(field("Comment:", &form.comment, Message::CommentChanged))
       .push(field(
         "Album Artist:",
@@ -1030,7 +1052,24 @@ fn load_full(
       .get_string(ItemKey::AlbumArtist)
       .map(|s| s.to_string())
       .unwrap_or_default();
-    form.year = tag.date().map(|d| d.year.to_string()).unwrap_or_default();
+    let tdrc = tag.date();
+    let tdrl = tag
+      .get_string(ItemKey::ReleaseDate)
+      .and_then(|s| s.parse::<Timestamp>().ok());
+    match (tdrc, tdrl) {
+      (Some(rec), Some(rel)) if rec != rel => {
+        form.date = rec.to_string();
+        form.release_date = Some(rel.to_string());
+      }
+      (Some(ts), _) | (_, Some(ts)) => {
+        form.date = ts.to_string();
+        form.release_date = None;
+      }
+      (None, None) => {
+        form.date = String::new();
+        form.release_date = None;
+      }
+    }
     form.track = tag.track().map(|t| t.to_string()).unwrap_or_default();
     form.track_total =
       tag.track_total().map(|t| t.to_string()).unwrap_or_default();
@@ -1181,7 +1220,7 @@ fn save_tags(path: &Path, form: &TagForm) -> Result<(), String> {
     tag.remove_key(ItemKey::FlagCompilation);
   }
 
-  set_or_remove_year(&mut tag, &form.year)?;
+  set_or_remove_dates(&mut tag, &form.date, form.release_date.as_deref())?;
   set_or_remove_u32(
     &mut tag,
     &form.track,
@@ -1232,22 +1271,47 @@ fn set_or_remove_string(
   }
 }
 
-fn set_or_remove_year(tag: &mut Tag, value: &str) -> Result<(), String> {
-  if value.trim().is_empty() {
-    tag.remove_date();
-    Ok(())
+fn set_or_remove_dates(
+  tag: &mut Tag,
+  date: &str,
+  release_date: Option<&str>,
+) -> Result<(), String> {
+  // TDRC (RecordingDate): de-facto "release date" read by most players.
+  let tdrc = parse_opt_date(date, "date")?;
+  // TDRL (ReleaseDate): semantically correct per the spec. When in unified
+  // mode (release_date == None), mirror TDRC so the two stay in sync.
+  let tdrl = match release_date {
+    Some(rd) => parse_opt_date(rd, "release date")?,
+    None => tdrc,
+  };
+
+  match tdrc {
+    Some(ts) => tag.set_date(ts),
+    None => tag.remove_date(),
+  }
+  match tdrl {
+    Some(ts) => {
+      tag.insert_text(ItemKey::ReleaseDate, ts.to_string());
+    }
+    None => tag.remove_key(ItemKey::ReleaseDate),
+  }
+
+  Ok(())
+}
+
+fn parse_opt_date(
+  value: &str,
+  label: &str,
+) -> Result<Option<Timestamp>, String> {
+  let trimmed = value.trim();
+  if trimmed.is_empty() {
+    Ok(None)
   }
   else {
-    match value.trim().parse::<u16>() {
-      Ok(year) => {
-        tag.set_date(Timestamp {
-          year,
-          ..Timestamp::default()
-        });
-        Ok(())
-      }
-      Err(_) => Err(format!("Invalid year: '{value}'")),
-    }
+    trimmed
+      .parse::<Timestamp>()
+      .map(Some)
+      .map_err(|_| format!("Invalid {label}: '{value}'"))
   }
 }
 
