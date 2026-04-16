@@ -593,7 +593,7 @@ impl Taguar {
     else {
       "Release Date:"
     };
-    let year_track_genre = row![
+    let year_genre = row![
       column![
         label(date_label),
         text_input("YYYY[-MM[-DD]]", &form.date)
@@ -601,15 +601,6 @@ impl Taguar {
           .size(12)
           .padding(4)
           .width(Length::Fixed(110.0)),
-      ]
-      .spacing(2),
-      column![
-        label("Track:"),
-        text_input("", &form.track)
-          .on_input(Message::TrackChanged)
-          .size(12)
-          .padding(4)
-          .width(Length::Fixed(50.0)),
       ]
       .spacing(2),
       column![
@@ -623,7 +614,16 @@ impl Taguar {
     ]
     .spacing(6);
 
-    let disc_comp = row![
+    let album_track_disc = row![
+      column![
+        label("Track:"),
+        text_input("", &form.track)
+          .on_input(Message::TrackChanged)
+          .size(12)
+          .padding(4)
+          .width(Length::Fixed(60.0)),
+      ]
+      .spacing(2),
       column![
         label("Disc Number:"),
         text_input("", &form.disc)
@@ -643,8 +643,24 @@ impl Taguar {
       ]
       .spacing(2),
     ]
-    .spacing(14)
+    .spacing(12)
     .align_y(Alignment::End);
+
+    let album_fieldset = container(
+      column![
+        text("Album").size(12).font(BOLD),
+        field("Album:", &form.album, Message::AlbumChanged),
+        field(
+          "Album Artist:",
+          &form.album_artist,
+          Message::AlbumArtistChanged,
+        ),
+        album_track_disc,
+      ]
+      .spacing(6),
+    )
+    .padding(8)
+    .style(fieldset_style);
 
     let save_row = row![
       button(text("Save").size(12))
@@ -689,8 +705,7 @@ impl Taguar {
       .push(row![play_btn].padding([0, 0]))
       .push(field("Title:", &form.title, Message::TitleChanged))
       .push(field("Artist:", &form.artist, Message::ArtistChanged))
-      .push(field("Album:", &form.album, Message::AlbumChanged))
-      .push(year_track_genre);
+      .push(year_genre);
     if let Some(rd) = &form.release_date {
       content = content.push(field(
         "Release Date (TDRL):",
@@ -720,13 +735,9 @@ impl Taguar {
     let comment_field = column![label("Comment:"), comment_row].spacing(2);
     content = content
       .push(comment_field)
-      .push(field(
-        "Album Artist:",
-        &form.album_artist,
-        Message::AlbumArtistChanged,
-      ))
       .push(field("Composer:", &form.composer, Message::ComposerChanged))
-      .push(disc_comp)
+      .push(Space::new().height(14))
+      .push(album_fieldset)
       .push(Space::new().height(6))
       .push(save_row);
 
@@ -933,6 +944,18 @@ fn cover_frame_style(_theme: &Theme) -> container::Style {
       color: BORDER,
       width: 1.0,
       radius: 2.0.into(),
+    },
+    ..container::Style::default()
+  }
+}
+
+fn fieldset_style(_theme: &Theme) -> container::Style {
+  container::Style {
+    background: Some(Background::Color(Color::WHITE)),
+    border: Border {
+      color: BORDER,
+      width: 1.0,
+      radius: 4.0.into(),
     },
     ..container::Style::default()
   }
