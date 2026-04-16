@@ -1,18 +1,19 @@
 #![windows_subsystem = "windows"]
 
 use iced::widget::{
-  button, checkbox, column, container, image, row, scrollable, text,
-  text_input, Column, Space,
+  button, checkbox, column, container, image, mouse_area, opaque, row,
+  scrollable, stack, text, text_input, Column, Space,
 };
 use iced::{
-  Alignment, Background, Border, Color, Element, Font, Length, Task, Theme,
+  event, mouse, Alignment, Background, Border, Color, Element, Event, Font,
+  Length, Point, Subscription, Task, Theme,
 };
 use lofty::config::WriteOptions;
 use lofty::file::TaggedFileExt;
 use lofty::picture::{Picture, PictureType};
 use lofty::prelude::{Accessor, AudioFile, ItemKey, TagExt};
 use lofty::tag::items::Timestamp;
-use lofty::tag::{Tag, TagType};
+use lofty::tag::{ItemValue, Tag, TagType};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -33,6 +34,7 @@ const BORDER: Color = Color::from_rgb(0.82, 0.82, 0.84);
 const PANEL_BG: Color = Color::from_rgb(0.98, 0.98, 0.99);
 const HEADER_BG: Color = Color::from_rgb(0.94, 0.94, 0.96);
 const MUTED: Color = Color::from_rgb(0.40, 0.40, 0.44);
+const MODAL_SCRIM: Color = Color::from_rgba(0.0, 0.0, 0.0, 0.45);
 
 const FONT_REGULAR_BYTES: &[u8] =
   include_bytes!("../fonts/FiraSans-Regular.ttf");
@@ -72,6 +74,7 @@ pub fn main() -> iced::Result {
     Taguar::update,
     Taguar::view,
   )
+  .subscription(Taguar::subscription)
   .title("Taguar")
   .theme(Theme::Light)
   .window_size((1200.0, 760.0))
@@ -94,6 +97,36 @@ struct Taguar {
   loading: bool,
   playing_path: Option<PathBuf>,
   is_paused: bool,
+  metadata_dump: Option<MetadataDump>,
+  /// Open right-click dropdown within the metadata modal.
+  copy_menu: Option<CopyMenu>,
+  /// Last known cursor position in window coordinates — captured from the
+  /// event subscription while the modal is open, so we can pin the dropdown
+  /// to where the user right-clicked.
+  last_cursor: Option<Point>,
+  /// Transient feedback shown in the modal header after a copy.
+  copy_feedback: Option<String>,
+}
+
+#[derive(Clone)]
+struct CopyMenu {
+  /// Anchor position (window coordinates) where the dropdown should appear.
+  at: Point,
+  key: String,
+  value: String,
+}
+
+/// Snapshot of the currently selected file's metadata, shown in the
+/// "All Metadata" modal as a heading plus (key, value) rows per section.
+#[derive(Clone)]
+struct MetadataDump {
+  sections: Vec<MetadataSection>,
+}
+
+#[derive(Clone)]
+struct MetadataSection {
+  heading: String,
+  rows: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -174,6 +207,21 @@ enum Message {
   CoverReplaceChosen(Option<PathBuf>),
   CoverDelete,
   CommentOpenUrl(String),
+  ShowAllMetadata,
+  HideAllMetadata,
+  /// Right-clicked on a metadata row — opens the copy dropdown pinned to
+  /// the last known cursor position.
+  OpenCopyMenu {
+    key: String,
+    value: String,
+  },
+  /// Closes any open copy menu without copying.
+  CloseCopyMenu,
+  /// Copies `text` to the system clipboard and closes the menu.
+  CopyToClipboard(String),
+  /// Tracks the cursor position while the metadata modal is visible so
+  /// [`Message::OpenCopyMenu`] knows where to place the dropdown.
+  CursorMoved(Point),
 }
 
 /// Describes a change to the embedded cover picture to apply during a save.
@@ -393,6 +441,64 @@ impl Taguar {
         open_url(&url);
         Task::none()
       }
+      Message::ShowAllMetadata => {
+        if let Some(idx) = self.selected_idx {
+          if let Some(info) = self.files.get(idx) {
+            self.metadata_dump = Some(load_metadata_dump(&info.path));
+          }
+        }
+        Task::none()
+      }
+      Message::HideAllMetadata => {
+        self.metadata_dump = None;
+        self.copy_menu = None;
+        self.copy_feedback = None;
+        self.last_cursor = None;
+        Task::none()
+      }
+      Message::OpenCopyMenu { key, value } => {
+        // Anchor the dropdown to the latest known cursor position; fall back
+        // to (0, 0) if we somehow haven't seen a move event yet.
+        let at = self.last_cursor.unwrap_or(Point::ORIGIN);
+        self.copy_menu = Some(CopyMenu { at, key, value });
+        Task::none()
+      }
+      Message::CloseCopyMenu => {
+        self.copy_menu = None;
+        Task::none()
+      }
+      Message::CopyToClipboard(text) => {
+        self.copy_menu = None;
+        let preview = if text.chars().count() > 48 {
+          let head: String = text.chars().take(48).collect();
+          format!("Copied: {head}…")
+        }
+        else {
+          format!("Copied: {text}")
+        };
+        self.copy_feedback = Some(preview);
+        iced::clipboard::write(text)
+      }
+      Message::CursorMoved(position) => {
+        self.last_cursor = Some(position);
+        Task::none()
+      }
+    }
+  }
+
+  /// Only subscribes to cursor events when the metadata modal is open — so
+  /// the rest of the app isn't paying for per-pixel messages.
+  fn subscription(&self) -> Subscription<Message> {
+    if self.metadata_dump.is_some() {
+      event::listen_with(|event, _status, _window| match event {
+        Event::Mouse(mouse::Event::CursorMoved { position }) => {
+          Some(Message::CursorMoved(position))
+        }
+        _ => None,
+      })
+    }
+    else {
+      Subscription::none()
     }
   }
 
@@ -437,7 +543,7 @@ impl Taguar {
     let sidebar = self.sidebar_view();
     let status = self.status_bar_view();
 
-    column![
+    let base: Element<Message> = column![
       header,
       row![
         container(table)
@@ -456,7 +562,12 @@ impl Taguar {
         .width(Length::Fill)
         .style(status_bar_style),
     ]
-    .into()
+    .into();
+
+    match &self.metadata_dump {
+      Some(dump) => stack![base, self.metadata_modal_view(dump)].into(),
+      None => base,
+    }
   }
 
   fn header_view(&self) -> Element<'_, Message> {
@@ -831,6 +942,19 @@ impl Taguar {
       content = content.push(v1_row("Comment", &v1.comment));
     }
 
+    if self.selected_idx.is_some() {
+      content = content.push(Space::new().height(12));
+      content = content.push(
+        row![
+          Space::new().width(Length::Fill),
+          button(text("Show All Metadata").size(11))
+            .on_press(Message::ShowAllMetadata)
+            .padding([4, 12]),
+        ]
+        .align_y(Alignment::Center),
+      );
+    }
+
     scrollable(content.padding(2)).height(Length::Fill).into()
   }
 
@@ -872,6 +996,158 @@ impl Taguar {
     ]
     .spacing(20)
     .into()
+  }
+
+  fn metadata_modal_view<'a>(
+    &'a self,
+    dump: &'a MetadataDump,
+  ) -> Element<'a, Message> {
+    let feedback: Element<Message> = match &self.copy_feedback {
+      Some(msg) => text(msg.clone()).size(11).color(ORANGE).into(),
+      None => Space::new().into(),
+    };
+    let header_row = row![
+      text("All Metadata").size(15).font(BOLD),
+      feedback,
+      Space::new().width(Length::Fill),
+      button(text("Close").size(12))
+        .on_press(Message::HideAllMetadata)
+        .padding([4, 12]),
+    ]
+    .align_y(Alignment::Center)
+    .spacing(10);
+
+    let mut body = Column::new().spacing(12);
+    for section in &dump.sections {
+      let mut section_col = Column::new()
+        .push(text(section.heading.clone()).size(12).font(BOLD))
+        .push(Space::new().height(4))
+        .spacing(2);
+
+      if section.rows.is_empty() {
+        section_col = section_col.push(text("(empty)").size(11).color(MUTED));
+      }
+      for (key, value) in &section.rows {
+        section_col = section_col.push(self.metadata_row_view(key, value));
+      }
+
+      body = body.push(section_col);
+    }
+
+    let panel = container(
+      column![
+        header_row,
+        Space::new().height(8),
+        text("Tip: right-click any value to copy it.")
+          .size(10)
+          .color(MUTED),
+        Space::new().height(6),
+        scrollable(body).spacing(8).height(Length::Fill),
+      ]
+      .spacing(0),
+    )
+    .padding(16)
+    .width(Length::Fixed(720.0))
+    .max_height(600.0)
+    .style(modal_panel_style);
+
+    // Dim background that closes the modal when left-clicked.
+    let scrim = mouse_area(
+      container(Space::new())
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(modal_scrim_style),
+    )
+    .on_press(Message::HideAllMetadata);
+
+    let centered = container(opaque(panel))
+      .center_x(Length::Fill)
+      .center_y(Length::Fill);
+
+    // Always return a 3-child stack so opening / closing the copy menu
+    // doesn't shuffle the widget tree and reset the scrollable's state.
+    let menu_overlay: Element<Message> = match &self.copy_menu {
+      Some(menu) => self.copy_menu_view(menu),
+      None => Space::new().into(),
+    };
+
+    stack![scrim, centered, menu_overlay].into()
+  }
+
+  fn metadata_row_view<'a>(
+    &self,
+    key: &'a str,
+    value: &'a str,
+  ) -> Element<'a, Message> {
+    let label = text(key.to_string())
+      .size(11)
+      .color(MUTED)
+      .font(BOLD)
+      .width(Length::Fixed(180.0));
+
+    // Let the value widget fill the remaining width so long values wrap
+    // inside the panel instead of pushing the row past the scrollable's
+    // reserved scrollbar area.
+    let value_area =
+      mouse_area(text(value.to_string()).size(11).width(Length::Fill))
+        .on_right_press(Message::OpenCopyMenu {
+          key: key.to_string(),
+          value: value.to_string(),
+        });
+
+    row![label, value_area]
+      .width(Length::Fill)
+      .spacing(10)
+      .align_y(Alignment::Start)
+      .into()
+  }
+
+  /// Renders the floating right-click dropdown at `menu.at`. The whole
+  /// window-sized area beneath the menu is a transparent scrim that closes
+  /// the menu on any click, so the menu feels like a real popup.
+  fn copy_menu_view(&self, menu: &CopyMenu) -> Element<'_, Message> {
+    let value_msg = Message::CopyToClipboard(menu.value.clone());
+    let pair_msg =
+      Message::CopyToClipboard(format!("{}: {}", menu.key, menu.value));
+
+    let panel = container(
+      column![
+        button(text("Copy Value").size(12))
+          .on_press(value_msg)
+          .padding([4, 12])
+          .width(Length::Fill)
+          .style(menu_item_style),
+        button(text("Copy Key: Value").size(12))
+          .on_press(pair_msg)
+          .padding([4, 12])
+          .width(Length::Fill)
+          .style(menu_item_style),
+      ]
+      .spacing(2),
+    )
+    .padding(4)
+    .width(Length::Fixed(180.0))
+    .style(menu_panel_style);
+
+    // Transparent full-window scrim that swallows any outside click and
+    // closes the menu.
+    let dismiss = mouse_area(
+      container(Space::new())
+        .width(Length::Fill)
+        .height(Length::Fill),
+    )
+    .on_press(Message::CloseCopyMenu)
+    .on_right_press(Message::CloseCopyMenu);
+
+    // Pin `panel` to `menu.at` using empty space offsets.
+    let x = menu.at.x.max(0.0);
+    let y = menu.at.y.max(0.0);
+    let positioned = column![
+      Space::new().height(Length::Fixed(y)),
+      row![Space::new().width(Length::Fixed(x)), opaque(panel)],
+    ];
+
+    stack![dismiss, positioned].into()
   }
 }
 
@@ -996,6 +1272,56 @@ fn alt_row_style(_theme: &Theme, status: button::Status) -> button::Style {
     background: Some(Background::Color(bg)),
     text_color: Color::BLACK,
     border: Border::default(),
+    ..button::Style::default()
+  }
+}
+
+fn modal_scrim_style(_theme: &Theme) -> container::Style {
+  container::Style {
+    background: Some(Background::Color(MODAL_SCRIM)),
+    ..container::Style::default()
+  }
+}
+
+fn modal_panel_style(_theme: &Theme) -> container::Style {
+  container::Style {
+    background: Some(Background::Color(Color::WHITE)),
+    border: Border {
+      color: BORDER,
+      width: 1.0,
+      radius: 6.0.into(),
+    },
+    ..container::Style::default()
+  }
+}
+
+fn menu_panel_style(_theme: &Theme) -> container::Style {
+  container::Style {
+    background: Some(Background::Color(Color::WHITE)),
+    border: Border {
+      color: BORDER,
+      width: 1.0,
+      radius: 4.0.into(),
+    },
+    ..container::Style::default()
+  }
+}
+
+fn menu_item_style(_theme: &Theme, status: button::Status) -> button::Style {
+  let (bg, fg) = match status {
+    button::Status::Hovered | button::Status::Pressed => {
+      (Some(Background::Color(ROW_HOVER)), Color::BLACK)
+    }
+    _ => (None, Color::BLACK),
+  };
+  button::Style {
+    background: bg,
+    text_color: fg,
+    border: Border {
+      color: Color::TRANSPARENT,
+      width: 0.0,
+      radius: 2.0.into(),
+    },
     ..button::Style::default()
   }
 }
@@ -1286,6 +1612,110 @@ fn load_full(
   }
 
   (form, id3v1_display, label, cover)
+}
+
+/// Collects every piece of metadata we can extract from `path` into one
+/// [`MetadataSection`] per logical group (file path, audio properties, each
+/// tag) for the "All Metadata" modal.
+fn load_metadata_dump(path: &Path) -> MetadataDump {
+  let mut sections = Vec::new();
+
+  sections.push(MetadataSection {
+    heading: "File".to_string(),
+    rows: vec![("Path".to_string(), path.display().to_string())],
+  });
+
+  let tagged_file = match lofty::read_from_path(path) {
+    Ok(f) => f,
+    Err(e) => {
+      sections.push(MetadataSection {
+        heading: "Error".to_string(),
+        rows: vec![("Message".to_string(), e.to_string())],
+      });
+      return MetadataDump { sections };
+    }
+  };
+
+  // Audio properties
+  let p = tagged_file.properties();
+  let mut props: Vec<(String, String)> = Vec::new();
+  props.push((
+    "File Type".to_string(),
+    format!("{:?}", tagged_file.file_type()),
+  ));
+  props.push((
+    "Duration".to_string(),
+    format_duration(p.duration().as_secs()),
+  ));
+  if let Some(br) = p.overall_bitrate() {
+    props.push(("Overall Bitrate".to_string(), format!("{br} kbps")));
+  }
+  if let Some(br) = p.audio_bitrate() {
+    props.push(("Audio Bitrate".to_string(), format!("{br} kbps")));
+  }
+  if let Some(sr) = p.sample_rate() {
+    props.push(("Sample Rate".to_string(), format!("{sr} Hz")));
+  }
+  if let Some(bd) = p.bit_depth() {
+    props.push(("Bit Depth".to_string(), format!("{bd} bit")));
+  }
+  if let Some(ch) = p.channels() {
+    props.push(("Channels".to_string(), ch.to_string()));
+  }
+  if let Ok(meta) = std::fs::metadata(path) {
+    props.push(("File Size".to_string(), format_size(meta.len())));
+  }
+  sections.push(MetadataSection {
+    heading: "Audio Properties".to_string(),
+    rows: props,
+  });
+
+  // One section per tag on the file (ID3v2, ID3v1, Vorbis, MP4 ilst, …).
+  for tag in tagged_file.tags() {
+    let heading = format!(
+      "{} ({} items)",
+      tag_type_label(tag.tag_type()),
+      tag.item_count()
+    );
+    let mut rows: Vec<(String, String)> = tag
+      .items()
+      .map(|item| {
+        let key = format!("{:?}", item.key());
+        let value = match item.value() {
+          ItemValue::Text(t) => t.clone(),
+          ItemValue::Locator(t) => format!("[locator] {t}"),
+          ItemValue::Binary(b) => format!("[binary] {} bytes", b.len()),
+        };
+        (key, value)
+      })
+      .collect();
+    for (i, pic) in tag.pictures().iter().enumerate() {
+      let mime = pic
+        .mime_type()
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+      let (w, h) = probe_image_dims(pic.data());
+      let dims = if w > 0 && h > 0 {
+        format!("{w}x{h}, ")
+      }
+      else {
+        String::new()
+      };
+      rows.push((
+        format!("Picture #{}", i + 1),
+        format!(
+          "{} — {}{} KB, {}",
+          pic_type_label(pic.pic_type()),
+          dims,
+          pic.data().len() / 1024,
+          mime
+        ),
+      ));
+    }
+    sections.push(MetadataSection { heading, rows });
+  }
+
+  MetadataDump { sections }
 }
 
 fn probe_image_dims(data: &[u8]) -> (u32, u32) {
