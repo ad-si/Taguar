@@ -1,4 +1,4 @@
-# Taguar
+# Taguar&nbsp;<img src="images/icon.svg" alt="Taguar icon" height="36" align="center" />
 
 A small desktop app for browsing a directory of audio files and editing their
 ID3v2 / primary metadata tags. Built with [Iced](https://iced.rs/) and
