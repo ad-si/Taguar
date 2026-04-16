@@ -396,7 +396,7 @@ impl Taguar {
           .height(Length::Fill)
           .style(panel_style),
         container(sidebar)
-          .width(Length::Fixed(290.0))
+          .width(Length::FillPortion(3))
           .height(Length::Fill)
           .style(sidebar_style)
           .padding(10),
