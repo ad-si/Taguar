@@ -703,8 +703,8 @@ impl Taguar {
     let mut content = Column::new()
       .spacing(6)
       .push(row![play_btn].padding([0, 0]))
-      .push(field("Title:", &form.title, Message::TitleChanged))
       .push(field("Artist:", &form.artist, Message::ArtistChanged))
+      .push(field("Title:", &form.title, Message::TitleChanged))
       .push(year_genre);
     if let Some(rd) = &form.release_date {
       content = content.push(field(
