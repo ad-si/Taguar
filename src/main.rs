@@ -9,7 +9,7 @@ use iced::{
 };
 use lofty::config::WriteOptions;
 use lofty::file::TaggedFileExt;
-use lofty::picture::PictureType;
+use lofty::picture::{Picture, PictureType};
 use lofty::prelude::{Accessor, AudioFile, ItemKey, TagExt};
 use lofty::tag::items::Timestamp;
 use lofty::tag::{Tag, TagType};
@@ -170,6 +170,17 @@ enum Message {
   PlayPauseToggle,
   Save,
   Saved(Result<(), String>),
+  CoverReplace,
+  CoverReplaceChosen(Option<PathBuf>),
+  CoverDelete,
+}
+
+/// Describes a change to the embedded cover picture to apply during a save.
+#[derive(Clone)]
+enum PictureChange {
+  None,
+  Replace(PathBuf),
+  Delete,
 }
 
 impl Taguar {
@@ -321,25 +332,7 @@ impl Taguar {
         }
         Task::none()
       }
-      Message::Save => {
-        if let Some(idx) = self.selected_idx {
-          let path = self.files[idx].path.clone();
-          let form = self.form.clone();
-          self.status = Some("Saving...".to_string());
-          Task::perform(
-            async move {
-              tokio::task::spawn_blocking(move || save_tags(&path, &form))
-                .await
-                .map_err(|e| e.to_string())
-                .and_then(|r| r)
-            },
-            Message::Saved,
-          )
-        }
-        else {
-          Task::none()
-        }
-      }
+      Message::Save => self.spawn_save(PictureChange::None, "Saving..."),
       Message::Saved(Ok(())) => {
         self.status = Some("Saved.".to_string());
         if let Some(idx) = self.selected_idx {
@@ -368,7 +361,58 @@ impl Taguar {
         self.status = Some(format!("Error: {e}"));
         Task::none()
       }
+      Message::CoverReplace => Task::perform(
+        async {
+          rfd::AsyncFileDialog::new()
+            .set_title("Choose cover image")
+            .add_filter(
+              "Image",
+              &["png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif"],
+            )
+            .pick_file()
+            .await
+            .map(|h| h.path().to_path_buf())
+        },
+        Message::CoverReplaceChosen,
+      ),
+      Message::CoverReplaceChosen(None) => Task::none(),
+      Message::CoverReplaceChosen(Some(img_path)) => {
+        let status = if self.cover.is_some() {
+          "Updating cover..."
+        }
+        else {
+          "Adding cover..."
+        };
+        self.spawn_save(PictureChange::Replace(img_path), status)
+      }
+      Message::CoverDelete => {
+        self.spawn_save(PictureChange::Delete, "Deleting cover...")
+      }
     }
+  }
+
+  /// Kicks off a background save that applies the current form plus an
+  /// optional picture change, reporting completion via [`Message::Saved`].
+  fn spawn_save(
+    &mut self,
+    pic_change: PictureChange,
+    status: &str,
+  ) -> Task<Message> {
+    let Some(idx) = self.selected_idx else {
+      return Task::none();
+    };
+    let path = self.files[idx].path.clone();
+    let form = self.form.clone();
+    self.status = Some(status.to_string());
+    Task::perform(
+      async move {
+        tokio::task::spawn_blocking(move || save_tags(&path, &form, pic_change))
+          .await
+          .map_err(|e| e.to_string())
+          .and_then(|r| r)
+      },
+      Message::Saved,
+    )
   }
 
   fn view(&self) -> Element<'_, Message> {
@@ -697,6 +741,36 @@ impl Taguar {
         ))
         .size(10)
         .color(MUTED),
+      );
+      content = content.push(Space::new().height(4));
+      content = content.push(
+        row![
+          button(text("Replace").size(12))
+            .on_press(Message::CoverReplace)
+            .padding([4, 10]),
+          button(text("Delete").size(12))
+            .on_press(Message::CoverDelete)
+            .padding([4, 10]),
+        ]
+        .spacing(6),
+      );
+    }
+    else if self.selected_idx.is_some() {
+      // No cover: render a placeholder matching the real cover's 240x240
+      // framing, with a centered "Add Cover" button.
+      content = content.push(Space::new().height(8));
+      content = content.push(
+        container(
+          container(
+            button(text("Add Cover").size(12))
+              .on_press(Message::CoverReplace)
+              .padding([6, 14]),
+          )
+          .center_x(Length::Fixed(240.0))
+          .center_y(Length::Fixed(240.0)),
+        )
+        .style(cover_frame_style)
+        .padding(1),
       );
     }
 
@@ -1170,7 +1244,11 @@ fn pic_type_label(t: PictureType) -> String {
   }
 }
 
-fn save_tags(path: &Path, form: &TagForm) -> Result<(), String> {
+fn save_tags(
+  path: &Path,
+  form: &TagForm,
+  pic_change: PictureChange,
+) -> Result<(), String> {
   let tagged_file = lofty::read_from_path(path).map_err(|e| e.to_string())?;
 
   let mut tag = match tagged_file
@@ -1182,6 +1260,8 @@ fn save_tags(path: &Path, form: &TagForm) -> Result<(), String> {
     Some(t) => t,
     None => Tag::new(tagged_file.primary_tag_type()),
   };
+
+  apply_picture_change(&mut tag, pic_change)?;
 
   set_or_remove_string(&mut tag, ItemKey::TrackTitle, &form.title, |t, v| {
     t.set_title(v)
@@ -1253,6 +1333,48 @@ fn save_tags(path: &Path, form: &TagForm) -> Result<(), String> {
   tag
     .save_to_path(path, WriteOptions::default())
     .map_err(|e| e.to_string())?;
+
+  Ok(())
+}
+
+fn apply_picture_change(
+  tag: &mut Tag,
+  change: PictureChange,
+) -> Result<(), String> {
+  // Index of the picture that the UI treats as "the cover": prefer
+  // CoverFront, else the first picture if any.
+  let cover_idx = tag
+    .pictures()
+    .iter()
+    .position(|p| p.pic_type() == PictureType::CoverFront)
+    .or_else(|| (!tag.pictures().is_empty()).then_some(0));
+
+  match change {
+    PictureChange::None => {}
+    PictureChange::Replace(img_path) => {
+      let image_file =
+        File::open(&img_path).map_err(|e| format!("open image: {e}"))?;
+      let mut reader = BufReader::new(image_file);
+      let mut new_pic =
+        Picture::from_reader(&mut reader).map_err(|e| e.to_string())?;
+
+      // Preserve the pic_type of the picture being replaced when possible.
+      let desired_type = cover_idx
+        .and_then(|i| tag.pictures().get(i).map(|p| p.pic_type()))
+        .unwrap_or(PictureType::CoverFront);
+      new_pic.set_pic_type(desired_type);
+
+      match cover_idx {
+        Some(i) => tag.set_picture(i, new_pic),
+        None => tag.push_picture(new_pic),
+      }
+    }
+    PictureChange::Delete => {
+      if let Some(i) = cover_idx {
+        tag.remove_picture(i);
+      }
+    }
+  }
 
   Ok(())
 }
