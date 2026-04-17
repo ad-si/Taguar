@@ -5,8 +5,8 @@ use iced::widget::{
   scrollable, stack, text, text_input, Column, Space,
 };
 use iced::{
-  event, mouse, Alignment, Background, Border, Color, Element, Event, Font,
-  Length, Point, Subscription, Task, Theme,
+  event, keyboard, mouse, Alignment, Background, Border, Color, Element, Event,
+  Font, Length, Point, Subscription, Task, Theme,
 };
 use lofty::config::WriteOptions;
 use lofty::file::TaggedFileExt;
@@ -222,6 +222,14 @@ enum Message {
   /// Tracks the cursor position while the metadata modal is visible so
   /// [`Message::OpenCopyMenu`] knows where to place the dropdown.
   CursorMoved(Point),
+  /// Move selection to the previous/next file in the list.
+  SelectPrevious,
+  SelectNext,
+  /// Focus the artist text input in the sidebar.
+  FocusArtist,
+  /// Move focus to the next/previous form field.
+  FocusNextField,
+  FocusPreviousField,
 }
 
 /// Describes a change to the embedded cover picture to apply during a save.
@@ -312,6 +320,32 @@ impl Taguar {
         }
         Task::none()
       }
+      Message::SelectPrevious => {
+        let idx = match self.selected_idx {
+          Some(i) if i > 0 => i - 1,
+          None if !self.files.is_empty() => 0,
+          _ => return Task::none(),
+        };
+        self.update(Message::FileSelected(idx))
+      }
+      Message::SelectNext => {
+        let idx = match self.selected_idx {
+          Some(i) if i + 1 < self.files.len() => i + 1,
+          None if !self.files.is_empty() => 0,
+          _ => return Task::none(),
+        };
+        self.update(Message::FileSelected(idx))
+      }
+      Message::FocusArtist => {
+        if self.selected_idx.is_some() {
+          iced::widget::operation::focus(iced::widget::Id::new("artist"))
+        }
+        else {
+          Task::none()
+        }
+      }
+      Message::FocusNextField => iced::widget::operation::focus_next(),
+      Message::FocusPreviousField => iced::widget::operation::focus_previous(),
       Message::TitleChanged(v) => {
         self.form.title = v;
         Task::none()
@@ -489,16 +523,49 @@ impl Taguar {
   /// Only subscribes to cursor events when the metadata modal is open — so
   /// the rest of the app isn't paying for per-pixel messages.
   fn subscription(&self) -> Subscription<Message> {
-    if self.metadata_dump.is_some() {
-      event::listen_with(|event, _status, _window| match event {
-        Event::Mouse(mouse::Event::CursorMoved { position }) => {
-          Some(Message::CursorMoved(position))
+    let keyboard_sub = event::listen_with(|event, status, _window| {
+      let captured = matches!(status, event::Status::Captured);
+      match event {
+        Event::Keyboard(keyboard::Event::KeyPressed {
+          key: keyboard::Key::Named(keyboard::key::Named::ArrowUp),
+          ..
+        }) if !captured => Some(Message::SelectPrevious),
+        Event::Keyboard(keyboard::Event::KeyPressed {
+          key: keyboard::Key::Named(keyboard::key::Named::ArrowDown),
+          ..
+        }) if !captured => Some(Message::SelectNext),
+        Event::Keyboard(keyboard::Event::KeyPressed {
+          key: keyboard::Key::Named(keyboard::key::Named::ArrowRight),
+          ..
+        }) if !captured => Some(Message::FocusArtist),
+        Event::Keyboard(keyboard::Event::KeyPressed {
+          key: keyboard::Key::Named(keyboard::key::Named::Tab),
+          modifiers,
+          ..
+        }) => {
+          if modifiers.shift() {
+            Some(Message::FocusPreviousField)
+          }
+          else {
+            Some(Message::FocusNextField)
+          }
         }
         _ => None,
-      })
+      }
+    });
+
+    if self.metadata_dump.is_some() {
+      let cursor_sub =
+        event::listen_with(|event, _status, _window| match event {
+          Event::Mouse(mouse::Event::CursorMoved { position }) => {
+            Some(Message::CursorMoved(position))
+          }
+          _ => None,
+        });
+      Subscription::batch([keyboard_sub, cursor_sub])
     }
     else {
-      Subscription::none()
+      keyboard_sub
     }
   }
 
@@ -814,7 +881,17 @@ impl Taguar {
     let mut content = Column::new()
       .spacing(6)
       .push(row![play_btn].padding([0, 0]))
-      .push(field("Artist:", &form.artist, Message::ArtistChanged))
+      .push(
+        column![
+          label("Artist:"),
+          text_input("", &form.artist)
+            .id(iced::widget::Id::new("artist"))
+            .on_input(Message::ArtistChanged)
+            .size(12)
+            .padding(4),
+        ]
+        .spacing(2),
+      )
       .push(field("Title:", &form.title, Message::TitleChanged))
       .push(year_genre);
     if let Some(rd) = &form.release_date {
