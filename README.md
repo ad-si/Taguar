@@ -4,7 +4,8 @@ A small desktop app for browsing a directory of audio files and editing their
 ID3v2 / primary metadata tags. Built with [Iced](https://iced.rs/) and
 [lofty](https://github.com/Serial-ATA/lofty-rs).
 
-![Taguar](screenshots/2026-04-16t1801_app.png)
+![Taguar](screenshots/2026-04-17t1352_app.png)
+
 
 ## Features
 
@@ -24,6 +25,7 @@ ID3v2 / primary metadata tags. Built with [Iced](https://iced.rs/) and
   with a Play / Pause button above the Title field
 - Bottom status bar showing selected-file and total duration + size
 
+
 ## Installation
 
 ### From crates.io
@@ -40,6 +42,7 @@ cd Taguar
 cargo install --path .
 ```
 
+
 ## Running
 
 ```sh
@@ -47,6 +50,7 @@ taguar                        # opens with a dir picker
 taguar /path/to/music         # opens that directory
 taguar --help                 # print usage
 ```
+
 
 ## Format support
 
@@ -56,8 +60,12 @@ working Opus decoder yet, so `.opus` files are routed through a dedicated
 decoder built on `libopus` (bundled via the `opus` crate) plus the `ogg` crate
 for container parsing.
 
+
 ## License
 
 Licensed under the GNU Affero General Public License v3.0 or later
 ([AGPL-3.0-or-later](https://www.gnu.org/licenses/agpl-3.0.html)).
 See [LICENSE](LICENSE) for the full text.
+
+
+https://sporks.space/2023/02/18/poor-schemas-poor-cataloguing-why-music-tagging-sucks/
