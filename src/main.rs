@@ -75,7 +75,10 @@ pub fn main() -> iced::Result {
     Taguar::view,
   )
   .subscription(Taguar::subscription)
-  .title("Taguar")
+  .title(|state: &Taguar| match &state.directory {
+    Some(dir) => format!("Taguar — {}", dir.to_string_lossy()),
+    None => "Taguar".to_string(),
+  })
   .theme(Theme::Light)
   .window_size((1200.0, 760.0))
   .font(FONT_REGULAR_BYTES)
@@ -776,18 +779,11 @@ impl Taguar {
   }
 
   fn header_view(&self) -> Element<'_, Message> {
-    let dir = self
-      .directory
-      .as_ref()
-      .map(|p| p.to_string_lossy().to_string())
-      .unwrap_or_default();
-
     container(
       row![
         button(text("Change Directory").size(12))
           .on_press(Message::SelectDirectory)
           .padding([4, 10]),
-        text(dir).size(12).font(BOLD).width(Length::Fill),
         button(text("Reload").size(12))
           .on_press(Message::Reload)
           .padding([4, 10]),
@@ -805,7 +801,7 @@ impl Taguar {
     // Columns: Filename | Artist | Title | Comment
     // Weights (proportional) — columns stretch to fill the available width.
     let weights: [u16; 4] = [8, 4, 5, 6];
-    let headers = ["Filename", "Artist", "Title", "Comment"];
+    let headers = ["File Path", "Artist", "Title", "Comment"];
 
     let header_cells: Vec<Element<Message>> = headers
       .iter()
