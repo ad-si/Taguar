@@ -114,6 +114,7 @@ struct Taguar {
   last_cursor: Option<Point>,
   /// Transient feedback shown in the modal header after a copy.
   copy_feedback: Option<String>,
+  genre_warning: Option<String>,
 }
 
 impl Default for Taguar {
@@ -138,6 +139,7 @@ impl Default for Taguar {
       copy_menu: None,
       last_cursor: None,
       copy_feedback: None,
+      genre_warning: None,
     }
   }
 }
@@ -426,6 +428,12 @@ impl Taguar {
         Task::none()
       }
       Message::GenreChanged(v) => {
+        self.genre_warning = if v.contains(';') || v.contains('/') {
+          Some("Use commas to separate genres".into())
+        }
+        else {
+          None
+        };
         self.form.genre = v;
         Task::none()
       }
@@ -911,14 +919,24 @@ impl Taguar {
           .width(Length::Fixed(110.0)),
       ]
       .spacing(2),
-      column![
-        label("Genre:"),
-        text_input("", &form.genre)
-          .on_input(Message::GenreChanged)
-          .size(12)
-          .padding(4),
-      ]
-      .spacing(2),
+      {
+        let mut col = column![
+          label("Genre:"),
+          text_input("Pop, Rock, Alt", &form.genre)
+            .on_input(Message::GenreChanged)
+            .size(12)
+            .padding(4),
+        ]
+        .spacing(2);
+        if let Some(warn) = &self.genre_warning {
+          col = col.push(
+            text(warn.as_str())
+              .size(10)
+              .color(Color::from_rgb(0.85, 0.2, 0.2)),
+          );
+        }
+        col
+      },
     ]
     .spacing(6);
 
@@ -973,12 +991,13 @@ impl Taguar {
     let save_btn = button(text("Save").size(12))
       .padding([4, 14])
       .style(primary_button_style);
-    let save_btn = if self.form != self.saved_form {
-      save_btn.on_press(Message::Save)
-    }
-    else {
-      save_btn
-    };
+    let save_btn =
+      if self.form != self.saved_form && self.genre_warning.is_none() {
+        save_btn.on_press(Message::Save)
+      }
+      else {
+        save_btn
+      };
     let save_row = row![
       save_btn,
       text(self.status.as_deref().unwrap_or(""))
@@ -1816,7 +1835,15 @@ fn load_full(
     form.disc = tag.disk().map(|d| d.to_string()).unwrap_or_default();
     form.disc_total =
       tag.disk_total().map(|d| d.to_string()).unwrap_or_default();
-    form.genre = tag.genre().map(|s| s.to_string()).unwrap_or_default();
+    form.genre = tag
+      .genre()
+      .map(|s| {
+        s.split(';')
+          .map(|g| g.trim())
+          .collect::<Vec<_>>()
+          .join(", ")
+      })
+      .unwrap_or_default();
     form.comment = tag.comment().map(|s| s.to_string()).unwrap_or_default();
     form.composer = tag
       .get_string(ItemKey::Composer)
@@ -2047,7 +2074,14 @@ fn save_tags(
   set_or_remove_string(&mut tag, ItemKey::AlbumTitle, &form.album, |t, v| {
     t.set_album(v)
   });
-  set_or_remove_string(&mut tag, ItemKey::Genre, &form.genre, |t, v| {
+  let genre_stored = form
+    .genre
+    .split(',')
+    .map(|g| g.trim())
+    .filter(|g| !g.is_empty())
+    .collect::<Vec<_>>()
+    .join(";");
+  set_or_remove_string(&mut tag, ItemKey::Genre, &genre_stored, |t, v| {
     t.set_genre(v)
   });
   set_or_remove_string(&mut tag, ItemKey::Comment, &form.comment, |t, v| {
