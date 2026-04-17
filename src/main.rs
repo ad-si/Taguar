@@ -6,7 +6,7 @@ use iced::widget::{
 };
 use iced::{
   event, keyboard, mouse, Alignment, Background, Border, Color, Element, Event,
-  Font, Length, Point, Subscription, Task, Theme,
+  Font, Length, Padding, Point, Subscription, Task, Theme,
 };
 use lofty::config::WriteOptions;
 use lofty::file::TaggedFileExt;
@@ -751,25 +751,30 @@ impl Taguar {
     let sidebar = self.sidebar_view();
     let status = self.status_bar_view();
 
-    let base: Element<Message> = column![
+    let left: Element<Message> = column![
       header,
-      row![
-        container(table)
-          .width(Length::FillPortion(7))
-          .height(Length::Fill)
-          .style(panel_style),
-        container(sidebar)
-          .width(Length::FillPortion(3))
-          .height(Length::Fill)
-          .style(sidebar_style)
-          .padding(10),
-      ]
-      .height(Length::Fill),
+      container(table)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(panel_style),
       container(status)
         .padding([4, 10])
         .width(Length::Fill)
         .style(status_bar_style),
     ]
+    .into();
+
+    let base: Element<Message> = row![
+      container(left)
+        .width(Length::FillPortion(7))
+        .height(Length::Fill),
+      container(sidebar)
+        .width(Length::FillPortion(3))
+        .height(Length::Fill)
+        .style(sidebar_style)
+        .padding(Padding::new(10.0).right(0.0)),
+    ]
+    .height(Length::Fill)
     .into();
 
     match &self.metadata_dump {
@@ -1115,23 +1120,20 @@ impl Taguar {
 
     // Cover
     if let Some(cov) = &self.cover {
-      content = content.push(Space::new().height(8));
-      content = content.push(
-        container(
-          image(cov.handle.clone())
-            .width(Length::Fixed(240.0))
-            .height(Length::Fixed(240.0)),
-        )
-        .style(cover_frame_style)
-        .padding(1),
-      );
       let dims = if cov.width > 0 && cov.height > 0 {
         format!("{}x{}, ", cov.width, cov.height)
       }
       else {
         String::new()
       };
-      content = content.push(
+      let cover_image = container(
+        image(cov.handle.clone())
+          .width(Length::Fixed(240.0))
+          .height(Length::Fixed(240.0)),
+      )
+      .style(cover_frame_style)
+      .padding(1);
+      let cover_details = column![
         text(format!(
           "{}{} KB, {}, {}",
           dims,
@@ -1141,9 +1143,6 @@ impl Taguar {
         ))
         .size(10)
         .color(MUTED),
-      );
-      content = content.push(Space::new().height(4));
-      content = content.push(
         row![
           button(text("Replace").size(12))
             .on_press(Message::CoverReplace)
@@ -1153,25 +1152,44 @@ impl Taguar {
             .padding([4, 10]),
         ]
         .spacing(6),
-      );
+      ]
+      .spacing(6);
+      let cover_fieldset = container(
+        column![
+          text("Cover").size(12).font(BOLD),
+          row![cover_image, cover_details].spacing(8).wrap(),
+        ]
+        .spacing(6),
+      )
+      .width(Length::Fill)
+      .padding(8)
+      .style(fieldset_style);
+      content = content.push(Space::new().height(8));
+      content = content.push(cover_fieldset);
     }
     else if self.selected_idx.is_some() {
-      // No cover: render a placeholder matching the real cover's 240x240
-      // framing, with a centered "Add Cover" button.
-      content = content.push(Space::new().height(8));
-      content = content.push(
-        container(
+      let cover_fieldset = container(
+        column![
+          text("Cover").size(12).font(BOLD),
           container(
-            button(text("Add Cover").size(12))
-              .on_press(Message::CoverReplace)
-              .padding([6, 14]),
+            container(
+              button(text("Add Cover").size(12))
+                .on_press(Message::CoverReplace)
+                .padding([6, 14]),
+            )
+            .center_x(Length::Fixed(240.0))
+            .center_y(Length::Fixed(240.0)),
           )
-          .center_x(Length::Fixed(240.0))
-          .center_y(Length::Fixed(240.0)),
-        )
-        .style(cover_frame_style)
-        .padding(1),
-      );
+          .style(cover_frame_style)
+          .padding(1),
+        ]
+        .spacing(6),
+      )
+      .width(Length::Fill)
+      .padding(8)
+      .style(fieldset_style);
+      content = content.push(Space::new().height(8));
+      content = content.push(cover_fieldset);
     }
 
     // ID3v1 read-only
@@ -1214,7 +1232,9 @@ impl Taguar {
       );
     }
 
-    scrollable(content.padding(2)).height(Length::Fill).into()
+    scrollable(content.padding(Padding::new(2.0).right(10.0)))
+      .height(Length::Fill)
+      .into()
   }
 
   fn status_bar_view(&self) -> Element<'_, Message> {
