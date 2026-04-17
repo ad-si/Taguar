@@ -90,6 +90,7 @@ struct Taguar {
   files: Vec<FileInfo>,
   selected_idx: Option<usize>,
   form: TagForm,
+  saved_form: TagForm,
   id3v1: Option<Id3v1Display>,
   cover: Option<CoverInfo>,
   primary_tag_label: String,
@@ -140,7 +141,7 @@ struct FileInfo {
   size_bytes: u64,
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, PartialEq)]
 struct TagForm {
   title: String,
   artist: String,
@@ -261,6 +262,7 @@ impl Taguar {
         self.files.clear();
         self.selected_idx = None;
         self.form = TagForm::default();
+        self.saved_form = TagForm::default();
         self.id3v1 = None;
         self.cover = None;
         self.primary_tag_label.clear();
@@ -284,6 +286,7 @@ impl Taguar {
           self.files.clear();
           self.selected_idx = None;
           self.form = TagForm::default();
+          self.saved_form = TagForm::default();
           self.id3v1 = None;
           self.cover = None;
           self.primary_tag_label.clear();
@@ -311,7 +314,8 @@ impl Taguar {
       Message::FileSelected(idx) => {
         if let Some(info) = self.files.get(idx) {
           let (form, id3v1, label, cover) = load_full(&info.path);
-          self.form = form;
+          self.form = form.clone();
+          self.saved_form = form;
           self.id3v1 = id3v1;
           self.primary_tag_label = label;
           self.cover = cover;
@@ -422,7 +426,8 @@ impl Taguar {
           let path = self.files[idx].path.clone();
           // Refresh editable form + cover.
           let (form, id3v1, label, cover) = load_full(&path);
-          self.form = form;
+          self.form = form.clone();
+          self.saved_form = form;
           self.id3v1 = id3v1;
           self.primary_tag_label = label;
           self.cover = cover;
@@ -840,11 +845,17 @@ impl Taguar {
     .padding(8)
     .style(fieldset_style);
 
+    let save_btn = button(text("Save").size(12))
+      .padding([4, 14])
+      .style(primary_button_style);
+    let save_btn = if self.form != self.saved_form {
+      save_btn.on_press(Message::Save)
+    }
+    else {
+      save_btn
+    };
     let save_row = row![
-      button(text("Save").size(12))
-        .on_press(Message::Save)
-        .padding([4, 14])
-        .style(primary_button_style),
+      save_btn,
       text(self.status.as_deref().unwrap_or(""))
         .size(11)
         .color(MUTED),
@@ -1408,6 +1419,7 @@ fn primary_button_style(
   status: button::Status,
 ) -> button::Style {
   let bg = match status {
+    button::Status::Disabled => Color::from_rgb(0.78, 0.78, 0.80),
     button::Status::Hovered | button::Status::Pressed => ORANGE_DARK,
     _ => ORANGE,
   };
