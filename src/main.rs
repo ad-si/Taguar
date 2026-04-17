@@ -2,7 +2,7 @@
 
 use iced::widget::{
   button, checkbox, column, container, image, mouse_area, opaque, row,
-  scrollable, stack, text, text_input, Column, Space,
+  scrollable, stack, text, text_editor, text_input, Column, Space,
 };
 use iced::{
   event, keyboard, mouse, Alignment, Background, Border, Color, Element, Event,
@@ -84,13 +84,20 @@ pub fn main() -> iced::Result {
   .run()
 }
 
-#[derive(Default)]
+const LYRICS_HEIGHT_DEFAULT: f32 = 120.0;
+const LYRICS_HEIGHT_MIN: f32 = 40.0;
+
 struct Taguar {
   directory: Option<PathBuf>,
   files: Vec<FileInfo>,
   selected_idx: Option<usize>,
   form: TagForm,
   saved_form: TagForm,
+  lyrics_content: text_editor::Content,
+  lyrics_height: f32,
+  /// Active lyrics-handle drag: (initial cursor_y, height at drag start).
+  /// `initial_y` is set on the first move event after press.
+  lyrics_drag: Option<(Option<f32>, f32)>,
   id3v1: Option<Id3v1Display>,
   cover: Option<CoverInfo>,
   primary_tag_label: String,
@@ -107,6 +114,32 @@ struct Taguar {
   last_cursor: Option<Point>,
   /// Transient feedback shown in the modal header after a copy.
   copy_feedback: Option<String>,
+}
+
+impl Default for Taguar {
+  fn default() -> Self {
+    Self {
+      lyrics_height: LYRICS_HEIGHT_DEFAULT,
+      directory: None,
+      files: Vec::new(),
+      selected_idx: None,
+      form: TagForm::default(),
+      saved_form: TagForm::default(),
+      lyrics_content: text_editor::Content::new(),
+      lyrics_drag: None,
+      id3v1: None,
+      cover: None,
+      primary_tag_label: String::new(),
+      status: None,
+      loading: false,
+      playing_path: None,
+      is_paused: false,
+      metadata_dump: None,
+      copy_menu: None,
+      last_cursor: None,
+      copy_feedback: None,
+    }
+  }
 }
 
 #[derive(Clone)]
@@ -158,6 +191,7 @@ struct TagForm {
   genre: String,
   comment: String,
   composer: String,
+  lyrics: String,
   compilation: bool,
 }
 
@@ -200,6 +234,10 @@ enum Message {
   GenreChanged(String),
   CommentChanged(String),
   ComposerChanged(String),
+  LyricsAction(text_editor::Action),
+  LyricsDragStart,
+  LyricsDragMove(Point),
+  LyricsDragEnd,
   CompilationToggled(bool),
   PlayPauseToggle,
   Save,
@@ -265,6 +303,7 @@ impl Taguar {
         self.selected_idx = None;
         self.form = TagForm::default();
         self.saved_form = TagForm::default();
+        self.lyrics_content = text_editor::Content::new();
         self.id3v1 = None;
         self.cover = None;
         self.primary_tag_label.clear();
@@ -289,6 +328,7 @@ impl Taguar {
           self.selected_idx = None;
           self.form = TagForm::default();
           self.saved_form = TagForm::default();
+          self.lyrics_content = text_editor::Content::new();
           self.id3v1 = None;
           self.cover = None;
           self.primary_tag_label.clear();
@@ -316,6 +356,7 @@ impl Taguar {
       Message::FileSelected(idx) => {
         if let Some(info) = self.files.get(idx) {
           let (form, id3v1, label, cover) = load_full(&info.path);
+          self.lyrics_content = text_editor::Content::with_text(&form.lyrics);
           self.form = form.clone();
           self.saved_form = form;
           self.id3v1 = id3v1;
@@ -396,6 +437,42 @@ impl Taguar {
         self.form.composer = v;
         Task::none()
       }
+      Message::LyricsAction(action) => {
+        if action.is_edit() {
+          self.lyrics_content.perform(action);
+          self.form.lyrics = self
+            .lyrics_content
+            .text()
+            .trim_end_matches('\n')
+            .to_string();
+        }
+        else {
+          self.lyrics_content.perform(action);
+        }
+        Task::none()
+      }
+      Message::LyricsDragStart => {
+        self.lyrics_drag = Some((None, self.lyrics_height));
+        Task::none()
+      }
+      Message::LyricsDragMove(pos) => {
+        if let Some((ref mut start_y, start_h)) = self.lyrics_drag {
+          match *start_y {
+            Some(sy) => {
+              self.lyrics_height =
+                (start_h + pos.y - sy).max(LYRICS_HEIGHT_MIN);
+            }
+            None => {
+              *start_y = Some(pos.y);
+            }
+          }
+        }
+        Task::none()
+      }
+      Message::LyricsDragEnd => {
+        self.lyrics_drag = None;
+        Task::none()
+      }
       Message::CompilationToggled(v) => {
         self.form.compilation = v;
         Task::none()
@@ -428,6 +505,7 @@ impl Taguar {
           let path = self.files[idx].path.clone();
           // Refresh editable form + cover.
           let (form, id3v1, label, cover) = load_full(&path);
+          self.lyrics_content = text_editor::Content::with_text(&form.lyrics);
           self.form = form.clone();
           self.saved_form = form;
           self.id3v1 = id3v1;
@@ -593,7 +671,20 @@ impl Taguar {
       }
     });
 
-    if self.metadata_dump.is_some() {
+    if self.lyrics_drag.is_some() {
+      let drag_sub =
+        event::listen_with(|event, _status, _window| match event {
+          Event::Mouse(mouse::Event::CursorMoved { position }) => {
+            Some(Message::LyricsDragMove(position))
+          }
+          Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+            Some(Message::LyricsDragEnd)
+          }
+          _ => None,
+        });
+      Subscription::batch([keyboard_sub, drag_sub])
+    }
+    else if self.metadata_dump.is_some() {
       let cursor_sub =
         event::listen_with(|event, _status, _window| match event {
           Event::Mouse(mouse::Event::CursorMoved { position }) => {
@@ -966,9 +1057,34 @@ impl Taguar {
         comment_input.into()
       };
     let comment_field = column![label("Comment:"), comment_row].spacing(2);
+    let lyrics_editor = text_editor(&self.lyrics_content)
+      .placeholder("Lyrics…")
+      .on_action(Message::LyricsAction)
+      .size(12)
+      .padding(4)
+      .height(self.lyrics_height);
+    let resize_handle: Element<Message> = mouse_area(
+      container(text("\u{25BC}").size(8).color(MUTED))
+        .center_x(Length::Fill)
+        .style(|_theme: &Theme| container::Style {
+          background: Some(Background::Color(HEADER_BG)),
+          border: Border {
+            color: BORDER,
+            width: 1.0,
+            radius: iced::border::bottom(4.0),
+          },
+          ..Default::default()
+        })
+        .padding([1, 0]),
+    )
+    .on_press(Message::LyricsDragStart)
+    .interaction(mouse::Interaction::ResizingVertically)
+    .into();
+    let lyrics_field = column![label("Lyrics:"), lyrics_editor, resize_handle];
     content = content
       .push(comment_field)
       .push(field("Composer:", &form.composer, Message::ComposerChanged))
+      .push(lyrics_field)
       .push(Space::new().height(14))
       .push(album_fieldset)
       .push(Space::new().height(6))
@@ -1706,6 +1822,11 @@ fn load_full(
       .get_string(ItemKey::Composer)
       .map(|s| s.to_string())
       .unwrap_or_default();
+    form.lyrics = tag
+      .get_string(ItemKey::Lyrics)
+      .or_else(|| tag.get_string(ItemKey::UnsyncLyrics))
+      .map(|s| s.to_string())
+      .unwrap_or_default();
     form.compilation = tag
       .get_string(ItemKey::FlagCompilation)
       .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
@@ -1945,6 +2066,23 @@ fn save_tags(
   }
   else {
     tag.insert_text(ItemKey::Composer, form.composer.clone());
+  }
+
+  let lyrics = form.lyrics.trim_end().to_string();
+  if lyrics.is_empty() {
+    tag.remove_key(ItemKey::Lyrics);
+    tag.remove_key(ItemKey::UnsyncLyrics);
+  }
+  else {
+    // Use Lyrics for formats that support it; UnsyncLyrics for ID3v2.
+    if tag.tag_type() == TagType::Id3v2 {
+      tag.remove_key(ItemKey::Lyrics);
+      tag.insert_text(ItemKey::UnsyncLyrics, lyrics);
+    }
+    else {
+      tag.remove_key(ItemKey::UnsyncLyrics);
+      tag.insert_text(ItemKey::Lyrics, lyrics);
+    }
   }
 
   if form.compilation {
