@@ -207,6 +207,8 @@ enum Message {
   CoverReplace,
   CoverReplaceChosen(Option<PathBuf>),
   CoverDelete,
+  Id3v1Delete,
+  Id3v1Deleted(Result<(), String>),
   CommentOpenUrl(String),
   ShowAllMetadata,
   HideAllMetadata,
@@ -475,6 +477,38 @@ impl Taguar {
       }
       Message::CoverDelete => {
         self.spawn_save(PictureChange::Delete, "Deleting cover...")
+      }
+      Message::Id3v1Delete => {
+        let Some(idx) = self.selected_idx else {
+          return Task::none();
+        };
+        let path = self.files[idx].path.clone();
+        self.status = Some("Deleting ID3v1 tag...".to_string());
+        Task::perform(
+          async move {
+            tokio::task::spawn_blocking(move || delete_id3v1_tag(&path))
+              .await
+              .map_err(|e| e.to_string())
+              .and_then(|r| r)
+          },
+          Message::Id3v1Deleted,
+        )
+      }
+      Message::Id3v1Deleted(Ok(())) => {
+        self.status = Some("ID3v1 tag deleted.".to_string());
+        self.id3v1 = None;
+        // Refresh metadata dump if open.
+        if let Some(idx) = self.selected_idx {
+          if self.metadata_dump.is_some() {
+            self.metadata_dump =
+              Some(load_metadata_dump(&self.files[idx].path));
+          }
+        }
+        Task::none()
+      }
+      Message::Id3v1Deleted(Err(e)) => {
+        self.status = Some(format!("Error deleting ID3v1: {e}"));
+        Task::none()
       }
       Message::CommentOpenUrl(url) => {
         open_url(&url);
@@ -1028,6 +1062,12 @@ impl Taguar {
       content = content.push(v1_row("Track", &v1.track));
       content = content.push(v1_row("Genre", &v1.genre));
       content = content.push(v1_row("Comment", &v1.comment));
+      content = content.push(
+        button(text("Delete ID3v1").size(10))
+          .on_press(Message::Id3v1Delete)
+          .padding([2, 8])
+          .style(button::danger),
+      );
     }
 
     if self.selected_idx.is_some() {
@@ -1949,6 +1989,12 @@ fn save_tags(
     .map_err(|e| e.to_string())?;
 
   Ok(())
+}
+
+fn delete_id3v1_tag(path: &Path) -> Result<(), String> {
+  Tag::new(TagType::Id3v1)
+    .remove_from_path(path)
+    .map_err(|e| e.to_string())
 }
 
 fn apply_picture_change(
