@@ -24,12 +24,28 @@ ID3v2 / primary metadata tags. Built with [Iced](https://iced.rs/) and
   with a Play / Pause button above the Title field
 - Bottom status bar showing selected-file and total duration + size
 
+## Installation
+
+### From crates.io
+
+```sh
+cargo install taguar
+```
+
+### From source
+
+```sh
+git clone https://github.com/ad-si/Taguar.git
+cd Taguar
+cargo install --path .
+```
+
 ## Running
 
 ```sh
-cargo run --release                                  # opens with a dir picker
-cargo run --release -- /path/to/music                # opens that directory
-cargo run --release -- --help                        # print usage
+taguar                        # opens with a dir picker
+taguar /path/to/music         # opens that directory
+taguar --help                 # print usage
 ```
 
 ## Format support
