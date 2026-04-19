@@ -8,8 +8,11 @@ use iced::{
   event, keyboard, mouse, Alignment, Background, Border, Color, Element, Event,
   Font, Length, Padding, Point, Subscription, Task, Theme,
 };
-use lofty::config::WriteOptions;
-use lofty::file::TaggedFileExt;
+use lofty::config::{ParseOptions, WriteOptions};
+use lofty::file::{FileType, TaggedFileExt};
+use lofty::flac::FlacFile;
+use lofty::id3::v2::Id3v2Tag;
+use lofty::ogg::{OpusFile, SpeexFile, VorbisComments, VorbisFile};
 use lofty::picture::{Picture, PictureType};
 use lofty::prelude::{Accessor, AudioFile, ItemKey, TagExt};
 use lofty::tag::items::Timestamp;
@@ -189,6 +192,8 @@ struct TagForm {
   // Some(_) only when the file's TDRC and TDRL differ; a second input then
   // appears in the form so both values can be edited independently.
   release_date: Option<String>,
+  // Custom TXXX:DATE_ADDED frame (ID3v2 only).
+  date_added: String,
   track: String,
   track_total: String,
   disc: String,
@@ -234,6 +239,7 @@ enum Message {
   AlbumArtistChanged(String),
   DateChanged(String),
   ReleaseDateChanged(String),
+  DateAddedChanged(String),
   TrackChanged(String),
   DiscChanged(String),
   GenreChanged(String),
@@ -420,6 +426,10 @@ impl Taguar {
       }
       Message::ReleaseDateChanged(v) => {
         self.form.release_date = Some(v);
+        Task::none()
+      }
+      Message::DateAddedChanged(v) => {
+        self.form.date_added = v;
         Task::none()
       }
       Message::TrackChanged(v) => {
@@ -1056,6 +1066,16 @@ impl Taguar {
         rd,
         Message::ReleaseDateChanged,
       ));
+    }
+    let date_added_label: Option<&'static str> =
+      match self.primary_tag_label.as_str() {
+        "ID3v2" => Some("Date Added (TXXX:DATE_ADDED):"),
+        "Vorbis Comments" => Some("Date Added (DATE_ADDED):"),
+        _ => None,
+      };
+    if let Some(lbl) = date_added_label {
+      content =
+        content.push(field(lbl, &form.date_added, Message::DateAddedChanged));
     }
     let comment_input = text_input("", &form.comment)
       .on_input(Message::CommentChanged)
@@ -1874,6 +1894,9 @@ fn load_full(
       .get_string(ItemKey::FlagCompilation)
       .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
       .unwrap_or(false);
+    form.date_added =
+      read_date_added(path, tagged_file.file_type(), tag.tag_type())
+        .unwrap_or_default();
 
     // Pick cover: prefer CoverFront, else first picture.
     if let Some(pic) = tag
@@ -2172,11 +2195,102 @@ fn save_tags(
     |t, v| t.set_disk_total(v),
   )?;
 
-  tag
-    .save_to_path(path, WriteOptions::default())
-    .map_err(|e| e.to_string())?;
+  let file_type = tagged_file.file_type();
+  let tag_type = tag.tag_type();
+  let date_added = form.date_added.trim().to_string();
+
+  if tag_type == TagType::Id3v2 {
+    let mut id3v2 = Id3v2Tag::from(tag);
+    if date_added.is_empty() {
+      id3v2.remove_user_text("DATE_ADDED");
+    }
+    else {
+      id3v2.insert_user_text("DATE_ADDED".to_string(), date_added);
+    }
+    id3v2
+      .save_to_path(path, WriteOptions::default())
+      .map_err(|e| e.to_string())?;
+  }
+  else {
+    tag
+      .save_to_path(path, WriteOptions::default())
+      .map_err(|e| e.to_string())?;
+    if tag_type == TagType::VorbisComments {
+      write_vorbis_date_added(path, file_type, &date_added)?;
+    }
+  }
 
   Ok(())
+}
+
+/// Reads a custom `DATE_ADDED` value from formats that carry a user-visible
+/// concept of one: ID3v2 uses a `TXXX:DATE_ADDED` frame; Vorbis Comments
+/// (Opus/Vorbis/FLAC/Speex) use a plain `DATE_ADDED` key.
+fn read_date_added(
+  path: &Path,
+  file_type: FileType,
+  tag_type: TagType,
+) -> Option<String> {
+  match tag_type {
+    TagType::Id3v2 => {
+      let tagged_file = lofty::read_from_path(path).ok()?;
+      let tag = tagged_file
+        .tags()
+        .iter()
+        .find(|t| t.tag_type() == TagType::Id3v2)?
+        .clone();
+      Id3v2Tag::from(tag)
+        .get_user_text("DATE_ADDED")
+        .map(str::to_string)
+    }
+    TagType::VorbisComments => {
+      let vc = read_vorbis_comments(path, file_type)?;
+      vc.get("DATE_ADDED").map(str::to_string)
+    }
+    _ => None,
+  }
+}
+
+fn read_vorbis_comments(
+  path: &Path,
+  file_type: FileType,
+) -> Option<VorbisComments> {
+  let file = File::open(path).ok()?;
+  let mut reader = BufReader::new(file);
+  let options = ParseOptions::new();
+  match file_type {
+    FileType::Opus => OpusFile::read_from(&mut reader, options)
+      .ok()
+      .map(|f| f.vorbis_comments().clone()),
+    FileType::Vorbis => VorbisFile::read_from(&mut reader, options)
+      .ok()
+      .map(|f| f.vorbis_comments().clone()),
+    FileType::Flac => FlacFile::read_from(&mut reader, options)
+      .ok()
+      .and_then(|f| f.vorbis_comments().cloned()),
+    FileType::Speex => SpeexFile::read_from(&mut reader, options)
+      .ok()
+      .map(|f| f.vorbis_comments().clone()),
+    _ => None,
+  }
+}
+
+fn write_vorbis_date_added(
+  path: &Path,
+  file_type: FileType,
+  date_added: &str,
+) -> Result<(), String> {
+  let Some(mut vc) = read_vorbis_comments(path, file_type) else {
+    return Ok(());
+  };
+  if date_added.is_empty() {
+    let _ = vc.remove("DATE_ADDED").count();
+  }
+  else {
+    vc.insert("DATE_ADDED".to_string(), date_added.to_string());
+  }
+  vc.save_to_path(path, WriteOptions::default())
+    .map_err(|e| e.to_string())
 }
 
 fn delete_id3v1_tag(path: &Path) -> Result<(), String> {
