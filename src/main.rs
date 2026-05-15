@@ -121,6 +121,7 @@ struct Taguar {
   /// Transient feedback shown in the modal header after a copy.
   copy_feedback: Option<String>,
   genre_warning: Option<String>,
+  cover_modal_open: bool,
 }
 
 impl Default for Taguar {
@@ -146,6 +147,7 @@ impl Default for Taguar {
       last_cursor: None,
       copy_feedback: None,
       genre_warning: None,
+      cover_modal_open: false,
     }
   }
 }
@@ -256,6 +258,8 @@ enum Message {
   CoverReplace,
   CoverReplaceChosen(Option<PathBuf>),
   CoverDelete,
+  ShowCoverModal,
+  HideCoverModal,
   Id3v1Delete,
   Id3v1Deleted(Result<(), String>),
   CommentOpenUrl(String),
@@ -577,6 +581,16 @@ impl Taguar {
       Message::CoverDelete => {
         self.spawn_save(PictureChange::Delete, "Deleting cover...")
       }
+      Message::ShowCoverModal => {
+        if self.cover.is_some() {
+          self.cover_modal_open = true;
+        }
+        Task::none()
+      }
+      Message::HideCoverModal => {
+        self.cover_modal_open = false;
+        Task::none()
+      }
       Message::Id3v1Delete => {
         let Some(idx) = self.selected_idx else {
           return Task::none();
@@ -688,6 +702,10 @@ impl Taguar {
             Some(Message::FocusNextField)
           }
         }
+        Event::Keyboard(keyboard::Event::KeyPressed {
+          key: keyboard::Key::Named(keyboard::key::Named::Escape),
+          ..
+        }) => Some(Message::HideCoverModal),
         _ => None,
       }
     });
@@ -787,10 +805,16 @@ impl Taguar {
     .height(Length::Fill)
     .into();
 
-    match &self.metadata_dump {
-      Some(dump) => stack![base, self.metadata_modal_view(dump)].into(),
-      None => base,
+    let mut layered: Element<Message> = base;
+    if let Some(dump) = &self.metadata_dump {
+      layered = stack![layered, self.metadata_modal_view(dump)].into();
     }
+    if self.cover_modal_open {
+      if let Some(cov) = &self.cover {
+        layered = stack![layered, self.cover_modal_view(cov)].into();
+      }
+    }
+    layered
   }
 
   fn header_view(&self) -> Element<'_, Message> {
@@ -1146,13 +1170,17 @@ impl Taguar {
       else {
         String::new()
       };
-      let cover_image = container(
-        image(cov.handle.clone())
-          .width(Length::Fixed(240.0))
-          .height(Length::Fixed(240.0)),
+      let cover_image: Element<Message> = mouse_area(
+        container(
+          image(cov.handle.clone())
+            .width(Length::Fixed(240.0))
+            .height(Length::Fixed(240.0)),
+        )
+        .style(cover_frame_style)
+        .padding(1),
       )
-      .style(cover_frame_style)
-      .padding(1);
+      .on_press(Message::ShowCoverModal)
+      .into();
       let cover_details = column![
         text(format!(
           "{}{} KB, {}, {}",
@@ -1295,6 +1323,45 @@ impl Taguar {
     ]
     .spacing(20)
     .into()
+  }
+
+  fn cover_modal_view<'a>(
+    &'a self,
+    cov: &'a CoverInfo,
+  ) -> Element<'a, Message> {
+    let (w, h) = if cov.width > 0 && cov.height > 0 {
+      let max_w = 900.0_f32;
+      let max_h = 650.0_f32;
+      let nw = cov.width as f32;
+      let nh = cov.height as f32;
+      let scale = (max_w / nw).min(max_h / nh);
+      (nw * scale, nh * scale)
+    }
+    else {
+      (600.0, 600.0)
+    };
+
+    let panel = container(
+      image(cov.handle.clone())
+        .width(Length::Fixed(w))
+        .height(Length::Fixed(h)),
+    )
+    .padding(8)
+    .style(modal_panel_style);
+
+    let scrim = mouse_area(
+      container(Space::new())
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(modal_scrim_style),
+    )
+    .on_press(Message::HideCoverModal);
+
+    let centered = container(opaque(panel))
+      .center_x(Length::Fill)
+      .center_y(Length::Fill);
+
+    stack![scrim, centered].into()
   }
 
   fn metadata_modal_view<'a>(
