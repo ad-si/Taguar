@@ -4,35 +4,30 @@ use lofty::prelude::{ItemKey, TagExt};
 use lofty::tag::{ItemValue, Tag, TagItem, TagType};
 use std::path::Path;
 
-/// Tag formats with a defined mapping for `ItemKey::Description`.
-/// Used to decide whether to surface a Description editor in the UI even
-/// when the file has none yet.
-pub fn tag_supports_description(tag_type: TagType) -> bool {
-  matches!(tag_type, TagType::VorbisComments | TagType::Mp4Ilst)
-}
-
-/// Returns every `Description` value present on the tag, in source order.
-///
-/// For tag types that support Description but currently have none, returns
-/// a single empty string so the UI shows one empty editor.
+/// Returns every `Description` value present on the tag, in source order,
+/// or a single empty string when none exist so the UI always shows one
+/// editor. Empty entries are dropped on save (see [`apply_descriptions`]).
 pub fn read_descriptions(tag: &Tag) -> Vec<String> {
   let mut descriptions: Vec<String> = tag
     .get_strings(ItemKey::Description)
     .map(|s| s.to_string())
     .collect();
-  if descriptions.is_empty() && tag_supports_description(tag.tag_type()) {
+  if descriptions.is_empty() {
     descriptions.push(String::new());
   }
   descriptions
 }
 
 /// Replaces all `Description` items on the tag with the given values,
-/// skipping empty ones (so emptied editors are removed on save).
+/// skipping empty ones (so emptied editors are removed on save). Uses
+/// `push_unchecked` so values reach lofty's per-format conversion even when
+/// the main map doesn't include `Description`; callers should verify the
+/// write afterwards rather than relying on a silent insert failure.
 pub fn apply_descriptions(tag: &mut Tag, descriptions: &[String]) {
   tag.remove_key(ItemKey::Description);
   for desc in descriptions {
     if !desc.is_empty() {
-      tag.push(TagItem::new(
+      tag.push_unchecked(TagItem::new(
         ItemKey::Description,
         ItemValue::Text(desc.clone()),
       ));
@@ -91,25 +86,20 @@ mod tests {
   }
 
   #[test]
-  fn tag_supports_description_matches_lofty_mappings() {
-    assert!(tag_supports_description(TagType::VorbisComments));
-    assert!(tag_supports_description(TagType::Mp4Ilst));
-    assert!(!tag_supports_description(TagType::Id3v2));
-    assert!(!tag_supports_description(TagType::Id3v1));
-    assert!(!tag_supports_description(TagType::Ape));
-    assert!(!tag_supports_description(TagType::RiffInfo));
-  }
-
-  #[test]
-  fn read_descriptions_returns_empty_placeholder_for_vorbis() {
-    let tag = Tag::new(TagType::VorbisComments);
-    assert_eq!(read_descriptions(&tag), vec![String::new()]);
-  }
-
-  #[test]
-  fn read_descriptions_returns_empty_for_unsupported_tag_type() {
-    let tag = Tag::new(TagType::Id3v2);
-    assert!(read_descriptions(&tag).is_empty());
+  fn read_descriptions_returns_placeholder_for_any_tag_type() {
+    for ty in [
+      TagType::VorbisComments,
+      TagType::Mp4Ilst,
+      TagType::Id3v2,
+      TagType::Ape,
+      TagType::RiffInfo,
+    ] {
+      assert_eq!(
+        read_descriptions(&Tag::new(ty)),
+        vec![String::new()],
+        "tag type {ty:?}"
+      );
+    }
   }
 
   #[test]

@@ -2180,6 +2180,14 @@ fn load_full(
     form.audio_source =
       read_audio_source(path, tagged_file.file_type(), tag.tag_type())
         .unwrap_or_default();
+    // ID3v2 has no native Description frame; we store descriptions as a
+    // TXXX:Description user-text frame, joined by `\0` for multi-value.
+    if tag.tag_type() == TagType::Id3v2 {
+      let descs = read_id3v2_descriptions(path);
+      if !descs.is_empty() {
+        form.descriptions = descs;
+      }
+    }
 
     // Pick cover: prefer CoverFront, else first picture.
     if let Some(pic) = tag
@@ -2515,6 +2523,7 @@ fn save_tags(
       id3v2.insert_user_text("DATE_ADDED".to_string(), date_added);
     }
     set_id3v2_user_url(&mut id3v2, "AUDIO_SOURCE", &audio_source);
+    set_id3v2_descriptions(&mut id3v2, &form.descriptions);
     id3v2
       .save_to_path(path, WriteOptions::default())
       .map_err(|e| e.to_string())?;
@@ -2581,6 +2590,26 @@ fn verify_saved(
   if form.compilation && tag.get_string(ItemKey::FlagCompilation).is_none() {
     missing.push("Compilation");
   }
+  let expected_descriptions: Vec<String> = form
+    .descriptions
+    .iter()
+    .filter(|d| !d.is_empty())
+    .cloned()
+    .collect();
+  if !expected_descriptions.is_empty() {
+    let actual: Vec<String> = if tag_type == TagType::Id3v2 {
+      read_id3v2_descriptions(path)
+    }
+    else {
+      tag
+        .get_strings(ItemKey::Description)
+        .map(str::to_string)
+        .collect()
+    };
+    if actual != expected_descriptions {
+      missing.push("Description");
+    }
+  }
 
   if missing.is_empty() {
     Ok(())
@@ -2591,6 +2620,45 @@ fn verify_saved(
       tag_type_label(tag_type),
       missing.join(", ")
     ))
+  }
+}
+
+/// Reads `TXXX:Description` from an ID3v2 file. Multi-value descriptions are
+/// stored joined by `\0` (the ID3v2.4 multi-value separator); this returns
+/// them split back into individual entries, or an empty Vec if the frame is
+/// absent.
+fn read_id3v2_descriptions(path: &Path) -> Vec<String> {
+  let Ok(tagged) = lofty::read_from_path(path) else {
+    return Vec::new();
+  };
+  let Some(tag) = tagged
+    .tags()
+    .iter()
+    .find(|t| t.tag_type() == TagType::Id3v2)
+    .cloned()
+  else {
+    return Vec::new();
+  };
+  match Id3v2Tag::from(tag).get_user_text("Description") {
+    Some(s) if !s.is_empty() => s.split('\0').map(str::to_string).collect(),
+    _ => Vec::new(),
+  }
+}
+
+/// Writes `descriptions` to ID3v2 as a single `TXXX:Description` frame, with
+/// multiple entries joined by `\0`. Empty entries are dropped, and removing
+/// all of them deletes the frame.
+fn set_id3v2_descriptions(tag: &mut Id3v2Tag, descriptions: &[String]) {
+  let non_empty: Vec<&str> = descriptions
+    .iter()
+    .map(String::as_str)
+    .filter(|d| !d.is_empty())
+    .collect();
+  if non_empty.is_empty() {
+    tag.remove_user_text("Description");
+  }
+  else {
+    tag.insert_user_text("Description".to_string(), non_empty.join("\0"));
   }
 }
 

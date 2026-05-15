@@ -101,10 +101,14 @@ fn overwriting_replaces_existing_descriptions() {
 }
 
 #[test]
-fn mp3_id3v2_silently_drops_descriptions() {
-  // ID3v2 has no `Description` mapping, so writes are dropped — verify the
-  // call still succeeds and reading returns nothing.
+fn mp3_id3v2_drops_descriptions_and_shows_placeholder() {
+  // ID3v2 has no `Description` mapping, so writes are dropped at the lib
+  // level. Reading still surfaces one empty placeholder so the UI can show
+  // an editor regardless of tag type.
   let path = copy_fixture("silence.mp3");
   write_descriptions_to_path(&path, &["ignored".to_string()]).unwrap();
-  assert!(read_descriptions_from_path(&path).unwrap().is_empty());
+  assert_eq!(
+    read_descriptions_from_path(&path).unwrap(),
+    vec![String::new()],
+  );
 }
