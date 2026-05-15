@@ -22,6 +22,7 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, OnceLock};
 use std::thread;
+use taguar::{apply_descriptions, read_descriptions};
 use walkdir::WalkDir;
 
 const AUDIO_EXTENSIONS: &[&str] = &[
@@ -100,6 +101,7 @@ struct Taguar {
   form: TagForm,
   saved_form: TagForm,
   lyrics_content: text_editor::Content,
+  description_contents: Vec<text_editor::Content>,
   lyrics_height: f32,
   /// Active lyrics-handle drag: (initial cursor_y, height at drag start).
   /// `initial_y` is set on the first move event after press.
@@ -134,6 +136,7 @@ impl Default for Taguar {
       form: TagForm::default(),
       saved_form: TagForm::default(),
       lyrics_content: text_editor::Content::new(),
+      description_contents: Vec::new(),
       lyrics_drag: None,
       id3v1: None,
       cover: None,
@@ -201,6 +204,7 @@ struct TagForm {
   disc: String,
   disc_total: String,
   genre: String,
+  descriptions: Vec<String>,
   comment: String,
   composer: String,
   lyrics: String,
@@ -246,6 +250,7 @@ enum Message {
   DiscChanged(String),
   GenreChanged(String),
   CommentChanged(String),
+  DescriptionAction(usize, text_editor::Action),
   ComposerChanged(String),
   LyricsAction(text_editor::Action),
   LyricsDragStart,
@@ -266,6 +271,7 @@ enum Message {
   Id3v1Delete,
   Id3v1Deleted(Result<(), String>),
   CommentOpenUrl(String),
+  DescriptionOpenUrl(String),
   ShowAllMetadata,
   HideAllMetadata,
   /// Right-clicked on a metadata row — opens the copy dropdown pinned to
@@ -322,6 +328,7 @@ impl Taguar {
         self.form = TagForm::default();
         self.saved_form = TagForm::default();
         self.lyrics_content = text_editor::Content::new();
+        self.description_contents = Vec::new();
         self.id3v1 = None;
         self.cover = None;
         self.primary_tag_label.clear();
@@ -347,6 +354,7 @@ impl Taguar {
           self.form = TagForm::default();
           self.saved_form = TagForm::default();
           self.lyrics_content = text_editor::Content::new();
+          self.description_contents = Vec::new();
           self.id3v1 = None;
           self.cover = None;
           self.primary_tag_label.clear();
@@ -375,6 +383,11 @@ impl Taguar {
         if let Some(info) = self.files.get(idx) {
           let (form, id3v1, label, cover) = load_full(&info.path);
           self.lyrics_content = text_editor::Content::with_text(&form.lyrics);
+          self.description_contents = form
+            .descriptions
+            .iter()
+            .map(|d| text_editor::Content::with_text(d))
+            .collect();
           self.form = form.clone();
           self.saved_form = form;
           self.id3v1 = id3v1;
@@ -461,6 +474,18 @@ impl Taguar {
         self.form.comment = v;
         Task::none()
       }
+      Message::DescriptionAction(idx, action) => {
+        if let Some(content) = self.description_contents.get_mut(idx) {
+          let is_edit = action.is_edit();
+          content.perform(action);
+          if is_edit {
+            if let Some(s) = self.form.descriptions.get_mut(idx) {
+              *s = content.text().trim_end_matches('\n').to_string();
+            }
+          }
+        }
+        Task::none()
+      }
       Message::ComposerChanged(v) => {
         self.form.composer = v;
         Task::none()
@@ -534,6 +559,11 @@ impl Taguar {
           // Refresh editable form + cover.
           let (form, id3v1, label, cover) = load_full(&path);
           self.lyrics_content = text_editor::Content::with_text(&form.lyrics);
+          self.description_contents = form
+            .descriptions
+            .iter()
+            .map(|d| text_editor::Content::with_text(d))
+            .collect();
           self.form = form.clone();
           self.saved_form = form;
           self.id3v1 = id3v1;
@@ -684,6 +714,10 @@ impl Taguar {
         Task::none()
       }
       Message::CommentOpenUrl(url) => {
+        open_url(&url);
+        Task::none()
+      }
+      Message::DescriptionOpenUrl(url) => {
         open_url(&url);
         Task::none()
       }
@@ -1184,6 +1218,39 @@ impl Taguar {
       content =
         content.push(field(lbl, &form.date_added, Message::DateAddedChanged));
     }
+    let description_fields: Vec<Element<Message>> = self
+      .description_contents
+      .iter()
+      .enumerate()
+      .map(|(idx, c)| {
+        let editor = text_editor(c)
+          .on_action(move |a| Message::DescriptionAction(idx, a))
+          .size(12)
+          .padding(4);
+        let desc_text = self
+          .form
+          .descriptions
+          .get(idx)
+          .map(String::as_str)
+          .unwrap_or("");
+        let editor_row: Element<Message> =
+          if let Some(url) = only_url(desc_text) {
+            row![
+              editor,
+              button(text("\u{1F310}").size(12))
+                .on_press(Message::DescriptionOpenUrl(url))
+                .padding([4, 8]),
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center)
+            .into()
+          }
+          else {
+            editor.into()
+          };
+        column![label("Description:"), editor_row].spacing(2).into()
+      })
+      .collect();
     let comment_input = text_input("", &form.comment)
       .on_input(Message::CommentChanged)
       .size(12)
@@ -1228,6 +1295,9 @@ impl Taguar {
     .interaction(mouse::Interaction::ResizingVertically)
     .into();
     let lyrics_field = column![label("Lyrics:"), lyrics_editor, resize_handle];
+    for desc_field in description_fields {
+      content = content.push(desc_field);
+    }
     content = content
       .push(comment_field)
       .push(field("Composer:", &form.composer, Message::ComposerChanged))
@@ -1836,6 +1906,13 @@ fn first_url(s: &str) -> Option<String> {
   }
 }
 
+/// Returns the URL when `s` (after trimming) is nothing but a single URL.
+fn only_url(s: &str) -> Option<String> {
+  let trimmed = s.trim();
+  let url = first_url(trimmed)?;
+  (url == trimmed).then_some(url)
+}
+
 /// Opens `url` in the user's default browser on the host platform.
 fn open_url(url: &str) {
   #[cfg(target_os = "macos")]
@@ -2034,6 +2111,7 @@ fn load_full(
       })
       .unwrap_or_default();
     form.comment = tag.comment().map(|s| s.to_string()).unwrap_or_default();
+    form.descriptions = read_descriptions(tag);
     form.composer = tag
       .get_string(ItemKey::Composer)
       .map(|s| s.to_string())
@@ -2305,6 +2383,8 @@ fn save_tags(
   set_or_remove_string(&mut tag, ItemKey::Comment, &form.comment, |t, v| {
     t.set_comment(v)
   });
+
+  apply_descriptions(&mut tag, &form.descriptions);
 
   if form.album_artist.is_empty() {
     tag.remove_key(ItemKey::AlbumArtist);
