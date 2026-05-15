@@ -69,3 +69,9 @@ See [LICENSE](LICENSE) for the full text.
 
 
 https://sporks.space/2023/02/18/poor-schemas-poor-cataloguing-why-music-tagging-sucks/
+
+
+Implement ideas from
+https://claude.ai/design/p/de72599e-baeb-4df8-81e5-64eeff8e2117?file=Taguar.html
+
+Promote on: https://www.reddit.com/r/audiophile

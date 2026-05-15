@@ -1128,9 +1128,32 @@ impl Taguar {
       play_btn = play_btn.on_press(Message::PlayPauseToggle);
     }
 
+    let selected_file = self.selected_idx.and_then(|i| self.files.get(i));
+    let file_info_text = selected_file
+      .map(|f| {
+        let ext = f
+          .path
+          .extension()
+          .and_then(|e| e.to_str())
+          .map(|s| s.to_uppercase())
+          .unwrap_or_default();
+        format!(
+          "{} | {} | {}",
+          ext,
+          format_size(f.size_bytes),
+          format_duration(f.duration_secs),
+        )
+      })
+      .unwrap_or_default();
+
     let mut content = Column::new()
       .spacing(6)
-      .push(row![play_btn].padding([0, 0]))
+      .push(
+        row![play_btn, text(file_info_text).size(11).color(MUTED),]
+          .spacing(12)
+          .align_y(Alignment::Center)
+          .padding([0, 0]),
+      )
       .push(
         column![
           label("Artist:"),
