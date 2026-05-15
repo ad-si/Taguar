@@ -16,7 +16,7 @@ use lofty::ogg::{OpusFile, SpeexFile, VorbisComments, VorbisFile};
 use lofty::picture::{Picture, PictureType};
 use lofty::prelude::{Accessor, AudioFile, ItemKey, TagExt};
 use lofty::tag::items::Timestamp;
-use lofty::tag::{ItemValue, Tag, TagType};
+use lofty::tag::{ItemValue, Tag, TagItem, TagType};
 use lofty::TextEncoding;
 use std::fs::File;
 use std::io::BufReader;
@@ -209,6 +209,7 @@ struct TagForm {
   descriptions: Vec<String>,
   comment: String,
   composer: String,
+  arranger: String,
   lyrics: String,
   compilation: bool,
 }
@@ -256,6 +257,7 @@ enum Message {
   CommentChanged(String),
   DescriptionAction(usize, text_editor::Action),
   ComposerChanged(String),
+  ArrangerChanged(String),
   LyricsAction(text_editor::Action),
   LyricsDragStart,
   LyricsDragMove(Point),
@@ -500,6 +502,10 @@ impl Taguar {
       }
       Message::ComposerChanged(v) => {
         self.form.composer = v;
+        Task::none()
+      }
+      Message::ArrangerChanged(v) => {
+        self.form.arranger = v;
         Task::none()
       }
       Message::LyricsAction(action) => {
@@ -1339,6 +1345,7 @@ impl Taguar {
     content = content
       .push(comment_field)
       .push(field("Composer:", &form.composer, Message::ComposerChanged))
+      .push(field("Arranger:", &form.arranger, Message::ArrangerChanged))
       .push(lyrics_field)
       .push(Space::new().height(14))
       .push(album_fieldset)
@@ -2154,6 +2161,10 @@ fn load_full(
       .get_string(ItemKey::Composer)
       .map(|s| s.to_string())
       .unwrap_or_default();
+    form.arranger = tag
+      .get_string(ItemKey::Arranger)
+      .map(|s| s.to_string())
+      .unwrap_or_default();
     form.lyrics = tag
       .get_string(ItemKey::Lyrics)
       .or_else(|| tag.get_string(ItemKey::UnsyncLyrics))
@@ -2427,39 +2438,34 @@ fn save_tags(
 
   apply_descriptions(&mut tag, &form.descriptions);
 
-  if form.album_artist.is_empty() {
-    tag.remove_key(ItemKey::AlbumArtist);
-  }
-  else {
-    tag.insert_text(ItemKey::AlbumArtist, form.album_artist.clone());
-  }
-
-  if form.composer.is_empty() {
-    tag.remove_key(ItemKey::Composer);
-  }
-  else {
-    tag.insert_text(ItemKey::Composer, form.composer.clone());
-  }
+  // `Tag::insert_text` only accepts keys mapped in the main per-format map,
+  // silently dropping otherwise. We use `insert_unchecked` so values reach
+  // lofty's per-format conversion (e.g. ID3v2's TIPL routing for Arranger);
+  // a post-save round-trip check then surfaces any value the target format
+  // can't represent.
+  put_or_remove(&mut tag, ItemKey::AlbumArtist, &form.album_artist);
+  put_or_remove(&mut tag, ItemKey::Composer, &form.composer);
+  put_or_remove(&mut tag, ItemKey::Arranger, &form.arranger);
 
   let lyrics = form.lyrics.trim_end().to_string();
-  if lyrics.is_empty() {
-    tag.remove_key(ItemKey::Lyrics);
-    tag.remove_key(ItemKey::UnsyncLyrics);
-  }
-  else {
+  tag.remove_key(ItemKey::Lyrics);
+  tag.remove_key(ItemKey::UnsyncLyrics);
+  if !lyrics.is_empty() {
     // Use Lyrics for formats that support it; UnsyncLyrics for ID3v2.
-    if tag.tag_type() == TagType::Id3v2 {
-      tag.remove_key(ItemKey::Lyrics);
-      tag.insert_text(ItemKey::UnsyncLyrics, lyrics);
+    let key = if tag.tag_type() == TagType::Id3v2 {
+      ItemKey::UnsyncLyrics
     }
     else {
-      tag.remove_key(ItemKey::UnsyncLyrics);
-      tag.insert_text(ItemKey::Lyrics, lyrics);
-    }
+      ItemKey::Lyrics
+    };
+    tag.insert_unchecked(TagItem::new(key, ItemValue::Text(lyrics)));
   }
 
   if form.compilation {
-    tag.insert_text(ItemKey::FlagCompilation, "1".to_string());
+    tag.insert_unchecked(TagItem::new(
+      ItemKey::FlagCompilation,
+      ItemValue::Text("1".to_string()),
+    ));
   }
   else {
     tag.remove_key(ItemKey::FlagCompilation);
@@ -2522,7 +2528,70 @@ fn save_tags(
     }
   }
 
+  verify_saved(path, form, tag_type)?;
+
   Ok(())
+}
+
+/// Re-reads the file after save and confirms every non-empty form field
+/// round-tripped. Surfaces a clear error rather than silently losing data
+/// when the target format can't represent a value (e.g. AIFF Text / RIFF
+/// INFO lacking a mapping for some `ItemKey`).
+fn verify_saved(
+  path: &Path,
+  form: &TagForm,
+  tag_type: TagType,
+) -> Result<(), String> {
+  let tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
+  let tag = tagged
+    .tags()
+    .iter()
+    .find(|t| t.tag_type() == tag_type)
+    .ok_or_else(|| "Saved tag not found on disk".to_string())?;
+
+  let mut missing: Vec<&str> = Vec::new();
+  let mut check = |name: &'static str, expected: &str, actual: Option<&str>| {
+    if !expected.is_empty() && actual.unwrap_or("") != expected {
+      missing.push(name);
+    }
+  };
+  check("Title", &form.title, tag.title().as_deref());
+  check("Artist", &form.artist, tag.artist().as_deref());
+  check("Album", &form.album, tag.album().as_deref());
+  check(
+    "Album Artist",
+    &form.album_artist,
+    tag.get_string(ItemKey::AlbumArtist),
+  );
+  check(
+    "Composer",
+    &form.composer,
+    tag.get_string(ItemKey::Composer),
+  );
+  check(
+    "Arranger",
+    &form.arranger,
+    tag.get_string(ItemKey::Arranger),
+  );
+  check("Comment", &form.comment, tag.comment().as_deref());
+  let lyrics_actual = tag
+    .get_string(ItemKey::Lyrics)
+    .or_else(|| tag.get_string(ItemKey::UnsyncLyrics));
+  check("Lyrics", form.lyrics.trim_end(), lyrics_actual);
+  if form.compilation && tag.get_string(ItemKey::FlagCompilation).is_none() {
+    missing.push("Compilation");
+  }
+
+  if missing.is_empty() {
+    Ok(())
+  }
+  else {
+    Err(format!(
+      "{} doesn't support: {}",
+      tag_type_label(tag_type),
+      missing.join(", ")
+    ))
+  }
 }
 
 /// Replaces or removes a `WXXX` frame keyed by `description`. Empty `value`
@@ -2736,12 +2805,25 @@ fn set_or_remove_dates(
   }
   match tdrl {
     Some(ts) => {
-      tag.insert_text(ItemKey::ReleaseDate, ts.to_string());
+      tag.insert_unchecked(TagItem::new(
+        ItemKey::ReleaseDate,
+        ItemValue::Text(ts.to_string()),
+      ));
     }
     None => tag.remove_key(ItemKey::ReleaseDate),
   }
 
   Ok(())
+}
+
+/// Writes `value` to the tag under `key`, bypassing lofty's per-format map
+/// check so values reach format-specific conversion (e.g. ID3v2 TIPL). Empty
+/// values remove the key.
+fn put_or_remove(tag: &mut Tag, key: ItemKey, value: &str) {
+  tag.remove_key(key);
+  if !value.is_empty() {
+    tag.insert_unchecked(TagItem::new(key, ItemValue::Text(value.to_string())));
+  }
 }
 
 fn parse_opt_date(
