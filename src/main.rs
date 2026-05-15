@@ -258,6 +258,9 @@ enum Message {
   CoverReplace,
   CoverReplaceChosen(Option<PathBuf>),
   CoverDelete,
+  CoverExport,
+  CoverExportChosen(Option<PathBuf>),
+  CoverExported(Result<PathBuf, String>),
   ShowCoverModal,
   HideCoverModal,
   Id3v1Delete,
@@ -580,6 +583,63 @@ impl Taguar {
       }
       Message::CoverDelete => {
         self.spawn_save(PictureChange::Delete, "Deleting cover...")
+      }
+      Message::CoverExport => {
+        let Some(idx) = self.selected_idx else {
+          return Task::none();
+        };
+        let Some(cov) = &self.cover else {
+          return Task::none();
+        };
+        let file_info = &self.files[idx];
+        let stem = Path::new(&file_info.filename)
+          .file_stem()
+          .map(|s| s.to_string_lossy().to_string())
+          .unwrap_or_else(|| "cover".to_string());
+        let ext = mime_to_extension(&cov.mime);
+        let default_name = format!("{stem}-cover.{ext}");
+        let start_dir = file_info
+          .path
+          .parent()
+          .map(|p| p.to_path_buf())
+          .unwrap_or_else(|| PathBuf::from("."));
+        Task::perform(
+          async move {
+            rfd::AsyncFileDialog::new()
+              .set_title("Export cover image")
+              .set_file_name(&default_name)
+              .set_directory(&start_dir)
+              .save_file()
+              .await
+              .map(|h| h.path().to_path_buf())
+          },
+          Message::CoverExportChosen,
+        )
+      }
+      Message::CoverExportChosen(None) => Task::none(),
+      Message::CoverExportChosen(Some(dest)) => {
+        let Some(idx) = self.selected_idx else {
+          return Task::none();
+        };
+        let src = self.files[idx].path.clone();
+        self.status = Some("Exporting cover...".to_string());
+        Task::perform(
+          async move {
+            tokio::task::spawn_blocking(move || export_cover(&src, &dest))
+              .await
+              .map_err(|e| e.to_string())
+              .and_then(|r| r)
+          },
+          Message::CoverExported,
+        )
+      }
+      Message::CoverExported(Ok(path)) => {
+        self.status = Some(format!("Exported cover to {}", path.display()));
+        Task::none()
+      }
+      Message::CoverExported(Err(e)) => {
+        self.status = Some(format!("Error exporting cover: {e}"));
+        Task::none()
       }
       Message::ShowCoverModal => {
         if self.cover.is_some() {
@@ -1194,6 +1254,9 @@ impl Taguar {
         row![
           button(text("Replace").size(12))
             .on_press(Message::CoverReplace)
+            .padding([4, 10]),
+          button(text("Export").size(12))
+            .on_press(Message::CoverExport)
             .padding([4, 10]),
           button(text("Delete").size(12))
             .on_press(Message::CoverDelete)
@@ -2123,6 +2186,32 @@ fn tag_type_label(tag_type: TagType) -> &'static str {
     TagType::AiffText => "AIFF Text",
     _ => "Tag",
   }
+}
+
+fn mime_to_extension(mime: &str) -> &'static str {
+  match mime.to_ascii_lowercase().as_str() {
+    "image/jpeg" | "image/jpg" => "jpg",
+    "image/png" => "png",
+    "image/gif" => "gif",
+    "image/bmp" => "bmp",
+    "image/tiff" => "tiff",
+    "image/webp" => "webp",
+    _ => "img",
+  }
+}
+
+fn export_cover(src: &Path, dest: &Path) -> Result<PathBuf, String> {
+  let tagged_file = lofty::read_from_path(src).map_err(|e| e.to_string())?;
+  let tag = editable_tag(&tagged_file)
+    .ok_or_else(|| "No editable tag found".to_string())?;
+  let pic = tag
+    .pictures()
+    .iter()
+    .find(|p| p.pic_type() == PictureType::CoverFront)
+    .or_else(|| tag.pictures().first())
+    .ok_or_else(|| "No embedded cover image".to_string())?;
+  std::fs::write(dest, pic.data()).map_err(|e| e.to_string())?;
+  Ok(dest.to_path_buf())
 }
 
 fn pic_type_label(t: PictureType) -> String {
