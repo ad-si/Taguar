@@ -11,12 +11,13 @@ use iced::{
 use lofty::config::{ParseOptions, WriteOptions};
 use lofty::file::{FileType, TaggedFileExt};
 use lofty::flac::FlacFile;
-use lofty::id3::v2::Id3v2Tag;
+use lofty::id3::v2::{ExtendedUrlFrame, Frame, Id3v2Tag};
 use lofty::ogg::{OpusFile, SpeexFile, VorbisComments, VorbisFile};
 use lofty::picture::{Picture, PictureType};
 use lofty::prelude::{Accessor, AudioFile, ItemKey, TagExt};
 use lofty::tag::items::Timestamp;
 use lofty::tag::{ItemValue, Tag, TagType};
+use lofty::TextEncoding;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -204,6 +205,7 @@ struct TagForm {
   disc: String,
   disc_total: String,
   genre: String,
+  audio_source: String,
   descriptions: Vec<String>,
   comment: String,
   composer: String,
@@ -249,6 +251,8 @@ enum Message {
   TrackChanged(String),
   DiscChanged(String),
   GenreChanged(String),
+  AudioSourceChanged(String),
+  AudioSourceOpenUrl(String),
   CommentChanged(String),
   DescriptionAction(usize, text_editor::Action),
   ComposerChanged(String),
@@ -468,6 +472,14 @@ impl Taguar {
           None
         };
         self.form.genre = v;
+        Task::none()
+      }
+      Message::AudioSourceChanged(v) => {
+        self.form.audio_source = v;
+        Task::none()
+      }
+      Message::AudioSourceOpenUrl(url) => {
+        open_url(&url);
         Task::none()
       }
       Message::CommentChanged(v) => {
@@ -1208,16 +1220,39 @@ impl Taguar {
         Message::ReleaseDateChanged,
       ));
     }
-    let date_added_label: Option<&'static str> =
-      match self.primary_tag_label.as_str() {
-        "ID3v2" => Some("Date Added (TXXX:DATE_ADDED):"),
-        "Vorbis Comments" => Some("Date Added (DATE_ADDED):"),
-        _ => None,
-      };
-    if let Some(lbl) = date_added_label {
-      content =
-        content.push(field(lbl, &form.date_added, Message::DateAddedChanged));
+    let supports_extras =
+      matches!(self.primary_tag_label.as_str(), "ID3v2" | "Vorbis Comments");
+    if supports_extras {
+      content = content.push(field(
+        "Date Added:",
+        &form.date_added,
+        Message::DateAddedChanged,
+      ));
     }
+    let audio_source_label = supports_extras.then_some("Audio Source:");
+    let audio_source_field: Option<Element<Message>> =
+      audio_source_label.map(|lbl| {
+        let input = text_input("", &form.audio_source)
+          .on_input(Message::AudioSourceChanged)
+          .size(12)
+          .padding(4);
+        let row_el: Element<Message> =
+          if let Some(url) = first_url(&form.audio_source) {
+            row![
+              input,
+              button(text("\u{1F310}").size(12))
+                .on_press(Message::AudioSourceOpenUrl(url))
+                .padding([4, 8]),
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center)
+            .into()
+          }
+          else {
+            input.into()
+          };
+        column![label(lbl), row_el].spacing(2).into()
+      });
     let description_fields: Vec<Element<Message>> = self
       .description_contents
       .iter()
@@ -1295,6 +1330,9 @@ impl Taguar {
     .interaction(mouse::Interaction::ResizingVertically)
     .into();
     let lyrics_field = column![label("Lyrics:"), lyrics_editor, resize_handle];
+    if let Some(field) = audio_source_field {
+      content = content.push(field);
+    }
     for desc_field in description_fields {
       content = content.push(desc_field);
     }
@@ -2128,6 +2166,9 @@ fn load_full(
     form.date_added =
       read_date_added(path, tagged_file.file_type(), tag.tag_type())
         .unwrap_or_default();
+    form.audio_source =
+      read_audio_source(path, tagged_file.file_type(), tag.tag_type())
+        .unwrap_or_default();
 
     // Pick cover: prefer CoverFront, else first picture.
     if let Some(pic) = tag
@@ -2457,6 +2498,7 @@ fn save_tags(
   let file_type = tagged_file.file_type();
   let tag_type = tag.tag_type();
   let date_added = form.date_added.trim().to_string();
+  let audio_source = form.audio_source.trim().to_string();
 
   if tag_type == TagType::Id3v2 {
     let mut id3v2 = Id3v2Tag::from(tag);
@@ -2466,6 +2508,7 @@ fn save_tags(
     else {
       id3v2.insert_user_text("DATE_ADDED".to_string(), date_added);
     }
+    set_id3v2_user_url(&mut id3v2, "AUDIO_SOURCE", &audio_source);
     id3v2
       .save_to_path(path, WriteOptions::default())
       .map_err(|e| e.to_string())?;
@@ -2475,11 +2518,30 @@ fn save_tags(
       .save_to_path(path, WriteOptions::default())
       .map_err(|e| e.to_string())?;
     if tag_type == TagType::VorbisComments {
-      write_vorbis_date_added(path, file_type, &date_added)?;
+      write_vorbis_extras(path, file_type, &date_added, &audio_source)?;
     }
   }
 
   Ok(())
+}
+
+/// Replaces or removes a `WXXX` frame keyed by `description`. Empty `value`
+/// removes any matching frame; otherwise inserts/replaces it.
+fn set_id3v2_user_url(tag: &mut Id3v2Tag, description: &str, value: &str) {
+  tag.retain(|frame| {
+    !matches!(
+      frame,
+      Frame::UserUrl(ExtendedUrlFrame { description: d, .. })
+        if d == description
+    )
+  });
+  if !value.is_empty() {
+    tag.insert(Frame::UserUrl(ExtendedUrlFrame::new(
+      TextEncoding::UTF8,
+      description.to_string(),
+      value.to_string(),
+    )));
+  }
 }
 
 /// Reads a custom `DATE_ADDED` value from formats that carry a user-visible
@@ -2510,6 +2572,40 @@ fn read_date_added(
   }
 }
 
+/// Reads the audio-source URL: ID3v2 uses a `WXXX:AUDIO_SOURCE` user-defined
+/// URL frame; Vorbis Comments use a plain `AUDIO_SOURCE` key.
+fn read_audio_source(
+  path: &Path,
+  file_type: FileType,
+  tag_type: TagType,
+) -> Option<String> {
+  match tag_type {
+    TagType::Id3v2 => {
+      let tagged_file = lofty::read_from_path(path).ok()?;
+      let tag = tagged_file
+        .tags()
+        .iter()
+        .find(|t| t.tag_type() == TagType::Id3v2)?
+        .clone();
+      (&Id3v2Tag::from(tag))
+        .into_iter()
+        .find_map(|frame| match frame {
+          Frame::UserUrl(ExtendedUrlFrame {
+            description,
+            content,
+            ..
+          }) if description == "AUDIO_SOURCE" => Some(content.to_string()),
+          _ => None,
+        })
+    }
+    TagType::VorbisComments => {
+      let vc = read_vorbis_comments(path, file_type)?;
+      vc.get("AUDIO_SOURCE").map(str::to_string)
+    }
+    _ => None,
+  }
+}
+
 fn read_vorbis_comments(
   path: &Path,
   file_type: FileType,
@@ -2534,22 +2630,28 @@ fn read_vorbis_comments(
   }
 }
 
-fn write_vorbis_date_added(
+fn write_vorbis_extras(
   path: &Path,
   file_type: FileType,
   date_added: &str,
+  audio_source: &str,
 ) -> Result<(), String> {
   let Some(mut vc) = read_vorbis_comments(path, file_type) else {
     return Ok(());
   };
-  if date_added.is_empty() {
-    let _ = vc.remove("DATE_ADDED").count();
-  }
-  else {
-    vc.insert("DATE_ADDED".to_string(), date_added.to_string());
-  }
+  set_vorbis_field(&mut vc, "DATE_ADDED", date_added);
+  set_vorbis_field(&mut vc, "AUDIO_SOURCE", audio_source);
   vc.save_to_path(path, WriteOptions::default())
     .map_err(|e| e.to_string())
+}
+
+fn set_vorbis_field(vc: &mut VorbisComments, key: &str, value: &str) {
+  if value.is_empty() {
+    let _ = vc.remove(key).count();
+  }
+  else {
+    vc.insert(key.to_string(), value.to_string());
+  }
 }
 
 fn delete_id3v1_tag(path: &Path) -> Result<(), String> {
