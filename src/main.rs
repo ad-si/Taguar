@@ -92,9 +92,6 @@ pub fn main() -> iced::Result {
   .run()
 }
 
-const LYRICS_HEIGHT_DEFAULT: f32 = 120.0;
-const LYRICS_HEIGHT_MIN: f32 = 40.0;
-
 struct Taguar {
   directory: Option<PathBuf>,
   files: Vec<FileInfo>,
@@ -102,11 +99,8 @@ struct Taguar {
   form: TagForm,
   saved_form: TagForm,
   lyrics_content: text_editor::Content,
+  comment_content: text_editor::Content,
   description_contents: Vec<text_editor::Content>,
-  lyrics_height: f32,
-  /// Active lyrics-handle drag: (initial cursor_y, height at drag start).
-  /// `initial_y` is set on the first move event after press.
-  lyrics_drag: Option<(Option<f32>, f32)>,
   id3v1: Option<Id3v1Display>,
   cover: Option<CoverInfo>,
   primary_tag_label: String,
@@ -130,15 +124,14 @@ struct Taguar {
 impl Default for Taguar {
   fn default() -> Self {
     Self {
-      lyrics_height: LYRICS_HEIGHT_DEFAULT,
       directory: None,
       files: Vec::new(),
       selected_idx: None,
       form: TagForm::default(),
       saved_form: TagForm::default(),
       lyrics_content: text_editor::Content::new(),
+      comment_content: text_editor::Content::new(),
       description_contents: Vec::new(),
-      lyrics_drag: None,
       id3v1: None,
       cover: None,
       primary_tag_label: String::new(),
@@ -254,14 +247,11 @@ enum Message {
   GenreChanged(String),
   AudioSourceChanged(String),
   AudioSourceOpenUrl(String),
-  CommentChanged(String),
+  CommentAction(text_editor::Action),
   DescriptionAction(usize, text_editor::Action),
   ComposerChanged(String),
   ArrangerChanged(String),
   LyricsAction(text_editor::Action),
-  LyricsDragStart,
-  LyricsDragMove(Point),
-  LyricsDragEnd,
   CompilationToggled(bool),
   PlayPauseToggle,
   Save,
@@ -334,6 +324,7 @@ impl Taguar {
         self.form = TagForm::default();
         self.saved_form = TagForm::default();
         self.lyrics_content = text_editor::Content::new();
+        self.comment_content = text_editor::Content::new();
         self.description_contents = Vec::new();
         self.id3v1 = None;
         self.cover = None;
@@ -389,6 +380,7 @@ impl Taguar {
         if let Some(info) = self.files.get(idx) {
           let (form, id3v1, label, cover) = load_full(&info.path);
           self.lyrics_content = text_editor::Content::with_text(&form.lyrics);
+          self.comment_content = text_editor::Content::with_text(&form.comment);
           self.description_contents = form
             .descriptions
             .iter()
@@ -484,8 +476,16 @@ impl Taguar {
         open_url(&url);
         Task::none()
       }
-      Message::CommentChanged(v) => {
-        self.form.comment = v;
+      Message::CommentAction(action) => {
+        let is_edit = action.is_edit();
+        self.comment_content.perform(action);
+        if is_edit {
+          self.form.comment = self
+            .comment_content
+            .text()
+            .trim_end_matches('\n')
+            .to_string();
+        }
         Task::none()
       }
       Message::DescriptionAction(idx, action) => {
@@ -509,39 +509,15 @@ impl Taguar {
         Task::none()
       }
       Message::LyricsAction(action) => {
-        if action.is_edit() {
-          self.lyrics_content.perform(action);
+        let is_edit = action.is_edit();
+        self.lyrics_content.perform(action);
+        if is_edit {
           self.form.lyrics = self
             .lyrics_content
             .text()
             .trim_end_matches('\n')
             .to_string();
         }
-        else {
-          self.lyrics_content.perform(action);
-        }
-        Task::none()
-      }
-      Message::LyricsDragStart => {
-        self.lyrics_drag = Some((None, self.lyrics_height));
-        Task::none()
-      }
-      Message::LyricsDragMove(pos) => {
-        if let Some((ref mut start_y, start_h)) = self.lyrics_drag {
-          match *start_y {
-            Some(sy) => {
-              self.lyrics_height =
-                (start_h + pos.y - sy).max(LYRICS_HEIGHT_MIN);
-            }
-            None => {
-              *start_y = Some(pos.y);
-            }
-          }
-        }
-        Task::none()
-      }
-      Message::LyricsDragEnd => {
-        self.lyrics_drag = None;
         Task::none()
       }
       Message::CompilationToggled(v) => {
@@ -577,6 +553,7 @@ impl Taguar {
           // Refresh editable form + cover.
           let (form, id3v1, label, cover) = load_full(&path);
           self.lyrics_content = text_editor::Content::with_text(&form.lyrics);
+          self.comment_content = text_editor::Content::with_text(&form.comment);
           self.description_contents = form
             .descriptions
             .iter()
@@ -822,20 +799,7 @@ impl Taguar {
       }
     });
 
-    if self.lyrics_drag.is_some() {
-      let drag_sub =
-        event::listen_with(|event, _status, _window| match event {
-          Event::Mouse(mouse::Event::CursorMoved { position }) => {
-            Some(Message::LyricsDragMove(position))
-          }
-          Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-            Some(Message::LyricsDragEnd)
-          }
-          _ => None,
-        });
-      Subscription::batch([keyboard_sub, drag_sub])
-    }
-    else if self.metadata_dump.is_some() {
+    if self.metadata_dump.is_some() {
       let cursor_sub =
         event::listen_with(|event, _status, _window| match event {
           Event::Mouse(mouse::Event::CursorMoved { position }) => {
@@ -1292,14 +1256,14 @@ impl Taguar {
         column![label("Description:"), editor_row].spacing(2).into()
       })
       .collect();
-    let comment_input = text_input("", &form.comment)
-      .on_input(Message::CommentChanged)
+    let comment_editor = text_editor(&self.comment_content)
+      .on_action(Message::CommentAction)
       .size(12)
       .padding(4);
     let comment_row: Element<Message> =
       if let Some(url) = first_url(&form.comment) {
         row![
-          comment_input,
+          comment_editor,
           button(text("\u{1F310}").size(12))
             .on_press(Message::CommentOpenUrl(url))
             .padding([4, 8]),
@@ -1309,33 +1273,14 @@ impl Taguar {
         .into()
       }
       else {
-        comment_input.into()
+        comment_editor.into()
       };
     let comment_field = column![label("Comment:"), comment_row].spacing(2);
     let lyrics_editor = text_editor(&self.lyrics_content)
-      .placeholder("Lyrics…")
       .on_action(Message::LyricsAction)
       .size(12)
-      .padding(4)
-      .height(self.lyrics_height);
-    let resize_handle: Element<Message> = mouse_area(
-      container(text("\u{25BC}").size(8).color(MUTED))
-        .center_x(Length::Fill)
-        .style(|_theme: &Theme| container::Style {
-          background: Some(Background::Color(HEADER_BG)),
-          border: Border {
-            color: BORDER,
-            width: 1.0,
-            radius: iced::border::bottom(4.0),
-          },
-          ..Default::default()
-        })
-        .padding([1, 0]),
-    )
-    .on_press(Message::LyricsDragStart)
-    .interaction(mouse::Interaction::ResizingVertically)
-    .into();
-    let lyrics_field = column![label("Lyrics:"), lyrics_editor, resize_handle];
+      .padding(4);
+    let lyrics_field = column![label("Lyrics:"), lyrics_editor].spacing(2);
     if let Some(field) = audio_source_field {
       content = content.push(field);
     }
