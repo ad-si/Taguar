@@ -261,6 +261,9 @@ enum Message {
   PlayPauseToggle,
   Save,
   Saved(Result<(), String>),
+  /// Discard any unsaved edits in the form, reverting to the last saved
+  /// snapshot.
+  Reset,
   CoverReplace,
   CoverReplaceChosen(Option<PathBuf>),
   CoverDelete,
@@ -645,6 +648,22 @@ impl Taguar {
       }
       Message::Saved(Err(e)) => {
         self.status = Some(format!("Error: {e}"));
+        Task::none()
+      }
+      Message::Reset => {
+        self.form = self.saved_form.clone();
+        self.lyrics_content =
+          text_editor::Content::with_text(&self.saved_form.lyrics);
+        self.comment_content =
+          text_editor::Content::with_text(&self.saved_form.comment);
+        self.description_contents = self
+          .saved_form
+          .descriptions
+          .iter()
+          .map(|d| text_editor::Content::with_text(d))
+          .collect();
+        self.nav_warning = false;
+        self.status = None;
         Task::none()
       }
       Message::CoverReplace => Task::perform(
@@ -1231,15 +1250,25 @@ impl Taguar {
     let save_btn = button(text("Save").size(12))
       .padding([4, 14])
       .style(primary_button_style);
-    let save_btn =
-      if self.form != self.saved_form && self.genre_warning.is_none() {
-        save_btn.on_press(Message::Save)
-      }
-      else {
-        save_btn
-      };
+    let has_unsaved = self.form != self.saved_form;
+    let save_btn = if has_unsaved && self.genre_warning.is_none() {
+      save_btn.on_press(Message::Save)
+    }
+    else {
+      save_btn
+    };
+    let reset_btn = button(text("Reset").size(12))
+      .padding([4, 8])
+      .style(text_button_style);
+    let reset_btn = if has_unsaved {
+      reset_btn.on_press(Message::Reset)
+    }
+    else {
+      reset_btn
+    };
     let save_row = row![
       save_btn,
+      reset_btn,
       text(self.status.as_deref().unwrap_or(""))
         .size(11)
         .color(MUTED),
@@ -1996,6 +2025,24 @@ fn primary_button_style(
   button::Style {
     background: Some(Background::Color(bg)),
     text_color: Color::WHITE,
+    border: Border {
+      color: Color::TRANSPARENT,
+      width: 0.0,
+      radius: 4.0.into(),
+    },
+    ..button::Style::default()
+  }
+}
+
+fn text_button_style(_theme: &Theme, status: button::Status) -> button::Style {
+  let text_color = match status {
+    button::Status::Disabled => Color::from_rgb(0.70, 0.70, 0.72),
+    button::Status::Hovered | button::Status::Pressed => ORANGE_DARK,
+    _ => MUTED,
+  };
+  button::Style {
+    background: None,
+    text_color,
     border: Border {
       color: Color::TRANSPARENT,
       width: 0.0,
