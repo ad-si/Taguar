@@ -9,7 +9,7 @@ keywords = ["audio", "metadata", "id3", "tags", "music"]
 categories = ["multimedia::audio"]
 
 [dependencies]
-iced = { version = "0.14", features = ["tokio", "image"] }
+iced = { version = "0.14", features = ["tokio", "image", "advanced"] }
 lofty = "0.24"
 rfd = "0.17"
 walkdir = "2.5"

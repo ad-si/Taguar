@@ -291,6 +291,13 @@ enum Message {
   /// Move focus to the next/previous form field.
   FocusNextField,
   FocusPreviousField,
+  /// Emacs-style line navigation in the focused input/editor.
+  CursorLineStart,
+  CursorLineEnd,
+  ApplyCursorMotion {
+    to_end: bool,
+    id: iced::widget::Id,
+  },
 }
 
 /// Describes a change to the embedded cover picture to apply during a save.
@@ -422,6 +429,38 @@ impl Taguar {
       }
       Message::FocusNextField => iced::widget::operation::focus_next(),
       Message::FocusPreviousField => iced::widget::operation::focus_previous(),
+      Message::CursorLineStart => iced::advanced::widget::operate(
+        iced::advanced::widget::operation::focusable::find_focused(),
+      )
+      .map(|id| Message::ApplyCursorMotion { to_end: false, id }),
+      Message::CursorLineEnd => iced::advanced::widget::operate(
+        iced::advanced::widget::operation::focusable::find_focused(),
+      )
+      .map(|id| Message::ApplyCursorMotion { to_end: true, id }),
+      Message::ApplyCursorMotion { to_end, id } => {
+        use iced::widget::text_editor::{Action, Motion};
+        let motion = if to_end { Motion::End } else { Motion::Home };
+        if id == iced::widget::Id::new("editor-lyrics") {
+          self.lyrics_content.perform(Action::Move(motion));
+          return Task::none();
+        }
+        if id == iced::widget::Id::new("editor-comment") {
+          self.comment_content.perform(Action::Move(motion));
+          return Task::none();
+        }
+        for (i, c) in self.description_contents.iter_mut().enumerate() {
+          if id == iced::widget::Id::from(format!("editor-description-{i}")) {
+            c.perform(Action::Move(motion));
+            return Task::none();
+          }
+        }
+        if to_end {
+          iced::widget::operation::move_cursor_to_end(id)
+        }
+        else {
+          iced::widget::operation::move_cursor_to_front(id)
+        }
+      }
       Message::TitleChanged(v) => {
         self.form.title = v;
         Task::none()
@@ -795,6 +834,21 @@ impl Taguar {
           key: keyboard::Key::Named(keyboard::key::Named::Escape),
           ..
         }) => Some(Message::HideCoverModal),
+        Event::Keyboard(keyboard::Event::KeyPressed {
+          ref key,
+          modifiers,
+          ..
+        }) if modifiers.control()
+          && !modifiers.shift()
+          && !modifiers.alt()
+          && !modifiers.logo() =>
+        {
+          match key.as_ref() {
+            keyboard::Key::Character("a") => Some(Message::CursorLineStart),
+            keyboard::Key::Character("e") => Some(Message::CursorLineEnd),
+            _ => None,
+          }
+        }
         _ => None,
       }
     });
@@ -1008,7 +1062,11 @@ impl Taguar {
      -> Element<Message> {
       column![
         label(lbl),
-        text_input("", val).on_input(msg).size(12).padding(4),
+        text_input("", val)
+          .id(iced::widget::Id::new(lbl))
+          .on_input(msg)
+          .size(12)
+          .padding(4),
       ]
       .spacing(2)
       .into()
@@ -1024,6 +1082,7 @@ impl Taguar {
       column![
         label(date_label),
         text_input("YYYY[-MM[-DD]]", &form.date)
+          .id(iced::widget::Id::new("field-date"))
           .on_input(Message::DateChanged)
           .size(12)
           .padding(4)
@@ -1034,6 +1093,7 @@ impl Taguar {
         let mut col = column![
           label("Genre:"),
           text_input("Pop, Rock, Alt", &form.genre)
+            .id(iced::widget::Id::new("field-genre"))
             .on_input(Message::GenreChanged)
             .size(12)
             .padding(4),
@@ -1055,6 +1115,7 @@ impl Taguar {
       column![
         label("Track:"),
         text_input("", &form.track)
+          .id(iced::widget::Id::new("field-track"))
           .on_input(Message::TrackChanged)
           .size(12)
           .padding(4)
@@ -1064,6 +1125,7 @@ impl Taguar {
       column![
         label("Disc Number:"),
         text_input("", &form.disc)
+          .id(iced::widget::Id::new("field-disc"))
           .on_input(Message::DiscChanged)
           .size(12)
           .padding(4)
@@ -1203,6 +1265,7 @@ impl Taguar {
     let audio_source_field: Option<Element<Message>> =
       audio_source_label.map(|lbl| {
         let input = text_input("", &form.audio_source)
+          .id(iced::widget::Id::new("field-audio-source"))
           .on_input(Message::AudioSourceChanged)
           .size(12)
           .padding(4);
@@ -1229,6 +1292,7 @@ impl Taguar {
       .enumerate()
       .map(|(idx, c)| {
         let editor = text_editor(c)
+          .id(iced::widget::Id::from(format!("editor-description-{idx}")))
           .on_action(move |a| Message::DescriptionAction(idx, a))
           .size(12)
           .padding(4);
@@ -1257,6 +1321,7 @@ impl Taguar {
       })
       .collect();
     let comment_editor = text_editor(&self.comment_content)
+      .id(iced::widget::Id::new("editor-comment"))
       .on_action(Message::CommentAction)
       .size(12)
       .padding(4);
@@ -1277,6 +1342,7 @@ impl Taguar {
       };
     let comment_field = column![label("Comment:"), comment_row].spacing(2);
     let lyrics_editor = text_editor(&self.lyrics_content)
+      .id(iced::widget::Id::new("editor-lyrics"))
       .on_action(Message::LyricsAction)
       .size(12)
       .padding(4);
