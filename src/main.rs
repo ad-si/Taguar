@@ -118,6 +118,10 @@ struct Taguar {
   /// Transient feedback shown in the modal header after a copy.
   copy_feedback: Option<String>,
   genre_warning: Option<String>,
+  /// Set when the user tried to switch songs with unsaved edits in the form.
+  /// Cleared once the changes are saved or the user reloads the current
+  /// song (clicking the same row re-reads from disk).
+  nav_warning: bool,
   cover_modal_open: bool,
 }
 
@@ -144,6 +148,7 @@ impl Default for Taguar {
       last_cursor: None,
       copy_feedback: None,
       genre_warning: None,
+      nav_warning: false,
       cover_modal_open: false,
     }
   }
@@ -331,6 +336,7 @@ impl Taguar {
         self.directory = Some(dir.clone());
         self.files.clear();
         self.selected_idx = None;
+        self.nav_warning = false;
         self.form = TagForm::default();
         self.saved_form = TagForm::default();
         self.lyrics_content = text_editor::Content::new();
@@ -358,6 +364,7 @@ impl Taguar {
           self.is_paused = false;
           self.files.clear();
           self.selected_idx = None;
+          self.nav_warning = false;
           self.form = TagForm::default();
           self.saved_form = TagForm::default();
           self.lyrics_content = text_editor::Content::new();
@@ -387,6 +394,11 @@ impl Taguar {
         Task::none()
       }
       Message::FileSelected(idx) => {
+        if self.selected_idx != Some(idx) && self.form != self.saved_form {
+          self.nav_warning = true;
+          return Task::none();
+        }
+        self.nav_warning = false;
         if let Some(info) = self.files.get(idx) {
           let (form, id3v1, label, cover) = load_full(&info.path);
           self.lyrics_content = text_editor::Content::with_text(&form.lyrics);
@@ -600,6 +612,7 @@ impl Taguar {
       Message::Save => self.spawn_save(PictureChange::None, "Saving..."),
       Message::Saved(Ok(())) => {
         self.status = Some("Saved.".to_string());
+        self.nav_warning = false;
         if let Some(idx) = self.selected_idx {
           let path = self.files[idx].path.clone();
           // Refresh editable form + cover.
@@ -935,7 +948,7 @@ impl Taguar {
     ]
     .into();
 
-    let base: Element<Message> = row![
+    let body: Element<Message> = row![
       container(left)
         .width(Length::FillPortion(7))
         .height(Length::Fill),
@@ -948,6 +961,13 @@ impl Taguar {
     .height(Length::Fill)
     .into();
 
+    let base: Element<Message> = if self.nav_warning {
+      column![self.nav_warning_banner(), body].into()
+    }
+    else {
+      body
+    };
+
     let mut layered: Element<Message> = base;
     if let Some(dump) = &self.metadata_dump {
       layered = stack![layered, self.metadata_modal_view(dump)].into();
@@ -958,6 +978,21 @@ impl Taguar {
       }
     }
     layered
+  }
+
+  fn nav_warning_banner(&self) -> Element<'_, Message> {
+    container(
+      text(
+        "Unsaved changes — save the current song before switching to another.",
+      )
+      .size(14)
+      .font(BOLD)
+      .color(Color::WHITE),
+    )
+    .padding([10, 16])
+    .width(Length::Fill)
+    .style(warning_banner_style)
+    .into()
   }
 
   fn header_view(&self) -> Element<'_, Message> {
@@ -1792,6 +1827,19 @@ fn header_bar_style(_theme: &Theme) -> container::Style {
     background: Some(Background::Color(HEADER_BG)),
     border: Border {
       color: BORDER,
+      width: 0.0,
+      radius: 0.0.into(),
+    },
+    ..container::Style::default()
+  }
+}
+
+fn warning_banner_style(_theme: &Theme) -> container::Style {
+  container::Style {
+    background: Some(Background::Color(Color::from_rgb(0.85, 0.2, 0.2))),
+    text_color: Some(Color::WHITE),
+    border: Border {
+      color: Color::from_rgb(0.6, 0.1, 0.1),
       width: 0.0,
       radius: 0.0.into(),
     },
