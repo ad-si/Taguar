@@ -298,6 +298,9 @@ enum Message {
     to_end: bool,
     id: iced::widget::Id,
   },
+  /// Clears all Album-section fields (album, album artist, track, disc,
+  /// compilation flag) so the user can blank them in one click.
+  AlbumClear,
 }
 
 /// Describes a change to the embedded cover picture to apply during a save.
@@ -460,6 +463,16 @@ impl Taguar {
         else {
           iced::widget::operation::move_cursor_to_front(id)
         }
+      }
+      Message::AlbumClear => {
+        self.form.album.clear();
+        self.form.album_artist.clear();
+        self.form.track.clear();
+        self.form.track_total.clear();
+        self.form.disc.clear();
+        self.form.disc_total.clear();
+        self.form.compilation = false;
+        Task::none()
       }
       Message::TitleChanged(v) => {
         self.form.title = v;
@@ -1145,9 +1158,28 @@ impl Taguar {
     .spacing(12)
     .align_y(Alignment::End);
 
+    let album_has_data = !form.album.is_empty()
+      || !form.album_artist.is_empty()
+      || !form.track.is_empty()
+      || !form.track_total.is_empty()
+      || !form.disc.is_empty()
+      || !form.disc_total.is_empty()
+      || form.compilation;
+    let mut album_delete_btn = button(text("Delete").size(11))
+      .padding([2, 8])
+      .style(button::danger);
+    if album_has_data {
+      album_delete_btn = album_delete_btn.on_press(Message::AlbumClear);
+    }
+    let album_header = row![
+      text("Album").size(12).font(BOLD),
+      Space::new().width(Length::Fill),
+      album_delete_btn,
+    ]
+    .align_y(Alignment::Center);
     let album_fieldset = container(
       column![
-        text("Album").size(12).font(BOLD),
+        album_header,
         field("Album:", &form.album, Message::AlbumChanged),
         field(
           "Album Artist:",
