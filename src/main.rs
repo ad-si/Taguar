@@ -447,6 +447,7 @@ enum Message {
   FilesLoaded(Vec<FileInfo>),
   FileSelected(usize),
   TitleChanged(String),
+  TitleFromFilename,
   ArtistChanged(String),
   AlbumChanged(String),
   AlbumArtistChanged(String),
@@ -715,6 +716,14 @@ impl Taguar {
       }
       Message::TitleChanged(v) => {
         self.form.title = v;
+        Task::none()
+      }
+      Message::TitleFromFilename => {
+        if let Some(file) = self.selected_idx.and_then(|i| self.files.get(i)) {
+          if let Some(title) = title_from_filename(&file.filename) {
+            self.form.title = title;
+          }
+        }
         Task::none()
       }
       Message::ArtistChanged(v) => {
@@ -1735,7 +1744,31 @@ impl Taguar {
         ]
         .spacing(2),
       )
-      .push(field("Title:", &form.title, Message::TitleChanged))
+      .push({
+        let input = text_input("", &form.title)
+          .id(iced::widget::Id::new("Title:"))
+          .on_input(Message::TitleChanged)
+          .size(12)
+          .padding(4);
+        let suggestion = (form.title.is_empty())
+          .then(|| selected_file.and_then(|f| title_from_filename(&f.filename)))
+          .flatten();
+        let input_row: Element<Message> = if suggestion.is_some() {
+          row![
+            input,
+            button(text("From Filepath").size(11))
+              .on_press(Message::TitleFromFilename)
+              .padding([4, 8]),
+          ]
+          .spacing(4)
+          .align_y(Alignment::Center)
+          .into()
+        }
+        else {
+          input.into()
+        };
+        column![label("Title:"), input_row].spacing(2)
+      })
       .push(year_genre);
     if let Some(rd) = &form.release_date {
       content = content.push(field(
@@ -2490,6 +2523,41 @@ fn only_url(s: &str) -> Option<String> {
   let trimmed = s.trim();
   let url = first_url(trimmed)?;
   (url == trimmed).then_some(url)
+}
+
+/// Derives a title suggestion from a file's path (relative to the loaded
+/// directory) by dropping the extension, turning path separators and
+/// `_`, `-`, `.` into spaces, and title-casing each word. Returns `None`
+/// when nothing usable remains.
+fn title_from_filename(filename: &str) -> Option<String> {
+  let path = Path::new(filename);
+  // Drop only the final extension, keeping any relative directory parts.
+  let stem = match (path.parent(), path.file_stem()) {
+    (Some(parent), Some(file_stem)) if !parent.as_os_str().is_empty() => {
+      parent.join(file_stem)
+    }
+    (_, Some(file_stem)) => PathBuf::from(file_stem),
+    _ => path.to_path_buf(),
+  };
+  let title = stem
+    .to_string_lossy()
+    .split(|c: char| {
+      matches!(c, '_' | '-' | '.' | '/' | '\\') || c.is_whitespace()
+    })
+    .filter(|w| !w.is_empty())
+    .map(|word| {
+      let mut chars = word.chars();
+      match chars.next() {
+        Some(first) => {
+          first.to_uppercase().collect::<String>()
+            + &chars.as_str().to_lowercase()
+        }
+        None => String::new(),
+      }
+    })
+    .collect::<Vec<_>>()
+    .join(" ");
+  (!title.is_empty()).then_some(title)
 }
 
 /// Label for the "reveal in file manager" menu item, named after the host
@@ -3778,5 +3846,41 @@ impl rodio::Source for OpusSource {
   }
   fn total_duration(&self) -> Option<std::time::Duration> {
     None
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::title_from_filename;
+
+  #[test]
+  fn title_cases_separators_and_drops_extension() {
+    assert_eq!(
+      title_from_filename("some_song-name.mp3").as_deref(),
+      Some("Some Song Name"),
+    );
+  }
+
+  #[test]
+  fn normalizes_existing_capitalization() {
+    assert_eq!(
+      title_from_filename("MY GREAT track.flac").as_deref(),
+      Some("My Great Track"),
+    );
+  }
+
+  #[test]
+  fn includes_relative_directory_parts() {
+    assert_eq!(
+      title_from_filename("Pink Floyd/The Wall/01_another-brick.mp3")
+        .as_deref(),
+      Some("Pink Floyd The Wall 01 Another Brick"),
+    );
+  }
+
+  #[test]
+  fn returns_none_when_nothing_usable() {
+    assert_eq!(title_from_filename("___.mp3"), None);
+    assert_eq!(title_from_filename(""), None);
   }
 }
