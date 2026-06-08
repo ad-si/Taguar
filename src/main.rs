@@ -1303,14 +1303,7 @@ impl Taguar {
     .height(Length::Fill)
     .into();
 
-    let base: Element<Message> = if self.nav_warning {
-      column![self.nav_warning_banner(), body].into()
-    }
-    else {
-      body
-    };
-
-    let mut layered: Element<Message> = base;
+    let mut layered: Element<Message> = body;
     if let Some(dump) = &self.metadata_dump {
       layered = stack![layered, self.metadata_modal_view(dump)].into();
     }
@@ -1921,6 +1914,10 @@ impl Taguar {
       .push(album_fieldset)
       .push(Space::new().height(6))
       .push(save_row);
+
+    if self.nav_warning {
+      content = content.push(self.nav_warning_banner());
+    }
 
     if !self.primary_tag_label.is_empty() {
       content = content.push(
