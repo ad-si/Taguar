@@ -418,6 +418,40 @@ struct TagForm {
   compilation: bool,
 }
 
+impl TagForm {
+  /// Returns a copy with surrounding whitespace stripped from every text
+  /// field, so stray spaces a user typed aren't persisted to the file.
+  /// `lyrics` keeps leading whitespace (only the end is trimmed) to preserve
+  /// intentional indentation.
+  fn trimmed(&self) -> TagForm {
+    TagForm {
+      title: self.title.trim().to_string(),
+      artist: self.artist.trim().to_string(),
+      album: self.album.trim().to_string(),
+      album_artist: self.album_artist.trim().to_string(),
+      date: self.date.trim().to_string(),
+      release_date: self.release_date.as_ref().map(|d| d.trim().to_string()),
+      date_added: self.date_added.trim().to_string(),
+      track: self.track.trim().to_string(),
+      track_total: self.track_total.trim().to_string(),
+      disc: self.disc.trim().to_string(),
+      disc_total: self.disc_total.trim().to_string(),
+      genre: self.genre.trim().to_string(),
+      audio_source: self.audio_source.trim().to_string(),
+      descriptions: self
+        .descriptions
+        .iter()
+        .map(|d| d.trim().to_string())
+        .collect(),
+      comment: self.comment.trim().to_string(),
+      composer: self.composer.trim().to_string(),
+      arranger: self.arranger.trim().to_string(),
+      lyrics: self.lyrics.trim_end().to_string(),
+      compilation: self.compilation,
+    }
+  }
+}
+
 #[derive(Clone)]
 struct Id3v1Display {
   title: String,
@@ -3062,6 +3096,10 @@ fn save_tags(
   form: &TagForm,
   pic_change: PictureChange,
 ) -> Result<(), String> {
+  // Normalize away surrounding whitespace before writing (and before the
+  // round-trip check in `verify_saved`, which receives this same `form`).
+  let form = &form.trimmed();
+
   let tagged_file = lofty::read_from_path(path).map_err(|e| e.to_string())?;
 
   let mut tag = match tagged_file
@@ -3110,7 +3148,7 @@ fn save_tags(
   put_or_remove(&mut tag, ItemKey::Composer, &form.composer);
   put_or_remove(&mut tag, ItemKey::Arranger, &form.arranger);
 
-  let lyrics = form.lyrics.trim_end().to_string();
+  let lyrics = form.lyrics.clone();
   tag.remove_key(ItemKey::Lyrics);
   tag.remove_key(ItemKey::UnsyncLyrics);
   if !lyrics.is_empty() {
@@ -3166,8 +3204,8 @@ fn save_tags(
 
   let file_type = tagged_file.file_type();
   let tag_type = tag.tag_type();
-  let date_added = form.date_added.trim().to_string();
-  let audio_source = form.audio_source.trim().to_string();
+  let date_added = form.date_added.clone();
+  let audio_source = form.audio_source.clone();
 
   if tag_type == TagType::Id3v2 {
     let mut id3v2 = Id3v2Tag::from(tag);
