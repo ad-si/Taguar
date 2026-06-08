@@ -111,6 +111,8 @@ struct Taguar {
   metadata_dump: Option<MetadataDump>,
   /// Open right-click dropdown within the metadata modal.
   copy_menu: Option<CopyMenu>,
+  /// Open right-click dropdown for a song row in the listing.
+  song_menu: Option<SongMenu>,
   /// Last known cursor position in window coordinates — captured from the
   /// event subscription while the modal is open, so we can pin the dropdown
   /// to where the user right-clicked.
@@ -145,6 +147,7 @@ impl Default for Taguar {
       is_paused: false,
       metadata_dump: None,
       copy_menu: None,
+      song_menu: None,
       last_cursor: None,
       copy_feedback: None,
       genre_warning: None,
@@ -160,6 +163,14 @@ struct CopyMenu {
   at: Point,
   key: String,
   value: String,
+}
+
+#[derive(Clone)]
+struct SongMenu {
+  /// Anchor position (window coordinates) where the dropdown should appear.
+  at: Point,
+  /// Filesystem path of the right-clicked song.
+  path: PathBuf,
 }
 
 /// Snapshot of the currently selected file's metadata, shown in the
@@ -288,6 +299,15 @@ enum Message {
   CloseCopyMenu,
   /// Copies `text` to the system clipboard and closes the menu.
   CopyToClipboard(String),
+  /// Right-clicked on a song row — opens the row dropdown pinned to the
+  /// last known cursor position.
+  OpenSongMenu(usize),
+  /// Closes any open song-row menu without acting.
+  CloseSongMenu,
+  /// Copies the song's filepath to the clipboard and closes the menu.
+  SongCopyPath(PathBuf),
+  /// Reveals the song in the OS file manager and closes the menu.
+  SongRevealInFinder(PathBuf),
   /// Tracks the cursor position while the metadata modal is visible so
   /// [`Message::OpenCopyMenu`] knows where to place the dropdown.
   CursorMoved(Point),
@@ -842,6 +862,33 @@ impl Taguar {
         self.last_cursor = Some(position);
         Task::none()
       }
+      Message::OpenSongMenu(idx) => {
+        // Anchor the dropdown to the latest known cursor position; fall back
+        // to (0, 0) if we somehow haven't seen a move event yet.
+        if let Some(info) = self.files.get(idx) {
+          let at = self.last_cursor.unwrap_or(Point::ORIGIN);
+          self.song_menu = Some(SongMenu {
+            at,
+            path: info.path.clone(),
+          });
+        }
+        Task::none()
+      }
+      Message::CloseSongMenu => {
+        self.song_menu = None;
+        Task::none()
+      }
+      Message::SongCopyPath(path) => {
+        self.song_menu = None;
+        let text = path.to_string_lossy().into_owned();
+        self.status = Some(format!("Copied path: {text}"));
+        iced::clipboard::write(text)
+      }
+      Message::SongRevealInFinder(path) => {
+        self.song_menu = None;
+        reveal_in_file_manager(&path);
+        Task::none()
+      }
     }
   }
 
@@ -898,7 +945,10 @@ impl Taguar {
       }
     });
 
-    if self.metadata_dump.is_some() {
+    // Track the cursor whenever a right-click dropdown could be opened: the
+    // metadata modal's copy menu, or the song listing's row menu (shown once
+    // a directory is loaded).
+    if self.metadata_dump.is_some() || self.directory.is_some() {
       let cursor_sub =
         event::listen_with(|event, _status, _window| match event {
           Event::Mouse(mouse::Event::CursorMoved { position }) => {
@@ -996,9 +1046,57 @@ impl Taguar {
         layered = stack![layered, self.cover_modal_view(cov)].into();
       }
     }
+    // Always stack a song-menu layer (an empty `Space` when closed) so
+    // opening / closing the menu doesn't change the widget tree and reset
+    // the listing scrollable's position.
+    let song_overlay: Element<Message> = match &self.song_menu {
+      Some(menu) => self.song_menu_view(menu),
+      None => Space::new().into(),
+    };
+    layered = stack![layered, song_overlay].into();
     layered
   }
 
+  /// Renders the floating right-click dropdown for a song row at `menu.at`,
+  /// mirroring [`copy_menu_view`](Self::copy_menu_view): a transparent
+  /// full-window scrim closes the menu on any outside click.
+  fn song_menu_view(&self, menu: &SongMenu) -> Element<'_, Message> {
+    let panel = container(
+      column![
+        button(text("Copy Filepath").size(12))
+          .on_press(Message::SongCopyPath(menu.path.clone()))
+          .padding([4, 12])
+          .width(Length::Fill)
+          .style(menu_item_style),
+        button(text(REVEAL_LABEL).size(12))
+          .on_press(Message::SongRevealInFinder(menu.path.clone()))
+          .padding([4, 12])
+          .width(Length::Fill)
+          .style(menu_item_style),
+      ]
+      .spacing(2),
+    )
+    .padding(4)
+    .width(Length::Fixed(180.0))
+    .style(menu_panel_style);
+
+    let dismiss = mouse_area(
+      container(Space::new())
+        .width(Length::Fill)
+        .height(Length::Fill),
+    )
+    .on_press(Message::CloseSongMenu)
+    .on_right_press(Message::CloseSongMenu);
+
+    let x = menu.at.x.max(0.0);
+    let y = menu.at.y.max(0.0);
+    let positioned = column![
+      Space::new().height(Length::Fixed(y)),
+      row![Space::new().width(Length::Fixed(x)), opaque(panel)],
+    ];
+
+    stack![dismiss, positioned].into()
+  }
   fn nav_warning_banner(&self) -> Element<'_, Message> {
     container(
       text(
@@ -2094,6 +2192,35 @@ fn only_url(s: &str) -> Option<String> {
   let trimmed = s.trim();
   let url = first_url(trimmed)?;
   (url == trimmed).then_some(url)
+}
+
+/// Label for the "reveal in file manager" menu item, named after the host
+/// platform's default file explorer.
+#[cfg(target_os = "macos")]
+const REVEAL_LABEL: &str = "Reveal in Finder";
+#[cfg(target_os = "windows")]
+const REVEAL_LABEL: &str = "Show in Explorer";
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+const REVEAL_LABEL: &str = "Show in File Manager";
+
+/// Reveals `path` in the host platform's file manager, selecting the file
+/// where supported.
+fn reveal_in_file_manager(path: &std::path::Path) {
+  #[cfg(target_os = "macos")]
+  let _ = std::process::Command::new("open")
+    .arg("-R")
+    .arg(path)
+    .spawn();
+  #[cfg(target_os = "windows")]
+  let _ = std::process::Command::new("explorer")
+    .arg(format!("/select,{}", path.display()))
+    .spawn();
+  // Linux/BSD: no portable "select the file" verb, so open its parent folder.
+  #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+  {
+    let target = path.parent().unwrap_or(path);
+    let _ = std::process::Command::new("xdg-open").arg(target).spawn();
+  }
 }
 
 /// Opens `url` in the user's default browser on the host platform.
