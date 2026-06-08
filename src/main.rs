@@ -18,6 +18,7 @@ use lofty::prelude::{Accessor, AudioFile, ItemKey, TagExt};
 use lofty::tag::items::Timestamp;
 use lofty::tag::{ItemValue, Tag, TagItem, TagType};
 use lofty::TextEncoding;
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -40,6 +41,9 @@ const PANEL_BG: Color = Color::from_rgb(0.98, 0.98, 0.99);
 const HEADER_BG: Color = Color::from_rgb(0.94, 0.94, 0.96);
 const MUTED: Color = Color::from_rgb(0.40, 0.40, 0.44);
 const MODAL_SCRIM: Color = Color::from_rgba(0.0, 0.0, 0.0, 0.45);
+
+/// Width of the column-picker dropdown panel.
+const COLUMN_MENU_WIDTH: f32 = 180.0;
 
 const FONT_REGULAR_BYTES: &[u8] =
   include_bytes!("../fonts/FiraSans-Regular.ttf");
@@ -92,6 +96,184 @@ pub fn main() -> iced::Result {
   .run()
 }
 
+/// A column that can be shown in the file listing. The variant order is the
+/// canonical left-to-right display order; visibility is controlled per column
+/// via [`Settings::visible_columns`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TableColumn {
+  FilePath,
+  Artist,
+  Title,
+  ReleaseDate,
+  Genre,
+  Description,
+  Comment,
+  Composer,
+  Arranger,
+  Album,
+  Duration,
+  Size,
+}
+
+impl TableColumn {
+  /// All columns in canonical display order.
+  const ALL: [TableColumn; 12] = [
+    Self::FilePath,
+    Self::Artist,
+    Self::Title,
+    Self::ReleaseDate,
+    Self::Genre,
+    Self::Description,
+    Self::Comment,
+    Self::Composer,
+    Self::Arranger,
+    Self::Album,
+    Self::Duration,
+    Self::Size,
+  ];
+
+  fn label(self) -> &'static str {
+    match self {
+      Self::FilePath => "File Path",
+      Self::Artist => "Artist",
+      Self::Title => "Title",
+      Self::Album => "Album",
+      Self::Genre => "Genre",
+      Self::ReleaseDate => "Release Date",
+      Self::Composer => "Composer",
+      Self::Arranger => "Arranger",
+      Self::Comment => "Comment",
+      Self::Description => "Description",
+      Self::Duration => "Duration",
+      Self::Size => "Size",
+    }
+  }
+
+  /// Proportional width used in both the header and the body rows.
+  fn weight(self) -> u16 {
+    match self {
+      Self::FilePath => 8,
+      Self::Artist => 4,
+      Self::Title => 5,
+      Self::Album => 5,
+      Self::Genre => 3,
+      Self::ReleaseDate => 3,
+      Self::Composer => 4,
+      Self::Arranger => 4,
+      Self::Comment => 6,
+      Self::Description => 6,
+      Self::Duration => 2,
+      Self::Size => 2,
+    }
+  }
+
+  fn cell_text(self, info: &FileInfo) -> String {
+    match self {
+      Self::FilePath => info.filename.clone(),
+      Self::Artist => info.artist.clone(),
+      Self::Title => info.title.clone(),
+      Self::Album => info.album.clone(),
+      Self::Genre => info.genre.clone(),
+      Self::ReleaseDate => info.release_date.clone(),
+      Self::Composer => info.composer.clone(),
+      Self::Arranger => info.arranger.clone(),
+      Self::Comment => info.comment.clone(),
+      Self::Description => info.description.clone(),
+      Self::Duration => format_duration(info.duration_secs),
+      Self::Size => format_size(info.size_bytes),
+    }
+  }
+}
+
+/// Persisted user settings. Loaded from [`settings_path`] on startup and
+/// written back whenever the user changes something (e.g. toggles a column).
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct Settings {
+  /// Columns to show in the listing, in canonical order. Stored as a list so
+  /// the on-disk file is self-describing; rendering always follows
+  /// [`TableColumn::ALL`] order regardless of the order here.
+  visible_columns: Vec<TableColumn>,
+}
+
+impl Default for Settings {
+  fn default() -> Self {
+    Self {
+      visible_columns: vec![
+        TableColumn::FilePath,
+        TableColumn::Artist,
+        TableColumn::Title,
+        TableColumn::Comment,
+      ],
+    }
+  }
+}
+
+impl Settings {
+  fn load() -> Self {
+    let Some(path) = settings_path() else {
+      return Self::default();
+    };
+    let mut settings: Settings = match std::fs::read_to_string(&path) {
+      Ok(contents) => serde_yaml::from_str(&contents).unwrap_or_default(),
+      Err(_) => Self::default(),
+    };
+    // Guard against a hand-edited file that hides every column.
+    if settings.visible_columns.is_empty() {
+      settings.visible_columns = Self::default().visible_columns;
+    }
+    settings
+  }
+
+  fn save(&self) {
+    let Some(path) = settings_path() else {
+      return;
+    };
+    if let Some(parent) = path.parent() {
+      let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(yaml) = serde_yaml::to_string(self) {
+      let _ = std::fs::write(&path, yaml);
+    }
+  }
+
+  fn is_visible(&self, column: TableColumn) -> bool {
+    self.visible_columns.contains(&column)
+  }
+
+  /// Adds the column (in canonical order) if hidden, removes it if shown.
+  /// Refuses to remove the last visible column — at least one must remain.
+  fn toggle_column(&mut self, column: TableColumn) {
+    if let Some(pos) = self.visible_columns.iter().position(|c| *c == column) {
+      if self.visible_columns.len() > 1 {
+        self.visible_columns.remove(pos);
+      }
+    }
+    else {
+      self.visible_columns.push(column);
+    }
+  }
+}
+
+/// Location of the YAML config file: `$XDG_CONFIG_HOME/taguar/config.yaml`,
+/// falling back to `%APPDATA%\taguar` on Windows and `~/.config/taguar`
+/// elsewhere.
+fn settings_path() -> Option<PathBuf> {
+  let dir = if let Some(xdg) =
+    std::env::var_os("XDG_CONFIG_HOME").filter(|s| !s.is_empty())
+  {
+    PathBuf::from(xdg)
+  }
+  else if cfg!(target_os = "windows") {
+    PathBuf::from(std::env::var_os("APPDATA")?)
+  }
+  else {
+    PathBuf::from(std::env::var_os("HOME")?).join(".config")
+  };
+  Some(dir.join("taguar").join("config.yaml"))
+}
+
 struct Taguar {
   directory: Option<PathBuf>,
   files: Vec<FileInfo>,
@@ -125,6 +307,11 @@ struct Taguar {
   /// song (clicking the same row re-reads from disk).
   nav_warning: bool,
   cover_modal_open: bool,
+  /// Persisted user settings (e.g. which listing columns are visible).
+  settings: Settings,
+  /// Anchor point of the open column-picker dropdown (window coordinates),
+  /// or `None` when it's closed.
+  column_menu: Option<Point>,
 }
 
 impl Default for Taguar {
@@ -153,6 +340,8 @@ impl Default for Taguar {
       genre_warning: None,
       nav_warning: false,
       cover_modal_open: false,
+      settings: Settings::load(),
+      column_menu: None,
     }
   }
 }
@@ -192,7 +381,13 @@ struct FileInfo {
   filename: String,
   title: String,
   artist: String,
+  album: String,
+  release_date: String,
+  genre: String,
   comment: String,
+  description: String,
+  composer: String,
+  arranger: String,
   duration_secs: u64,
   size_bytes: u64,
 }
@@ -329,6 +524,13 @@ enum Message {
   /// Clears all Album-section fields (album, album artist, track, disc,
   /// compilation flag) so the user can blank them in one click.
   AlbumClear,
+  /// Toggle the column-picker dropdown in the listing header.
+  ToggleColumnMenu,
+  /// Close the column-picker dropdown without acting.
+  CloseColumnMenu,
+  /// Show / hide a listing column; the change is persisted to the settings
+  /// file immediately.
+  ToggleColumn(TableColumn),
 }
 
 /// Describes a change to the embedded cover picture to apply during a save.
@@ -889,6 +1091,26 @@ impl Taguar {
         reveal_in_file_manager(&path);
         Task::none()
       }
+      Message::ToggleColumnMenu => {
+        // Anchor the dropdown to the button via the latest cursor position so
+        // it drops down right under the click.
+        self.column_menu = if self.column_menu.is_some() {
+          None
+        }
+        else {
+          Some(self.last_cursor.unwrap_or(Point::ORIGIN))
+        };
+        Task::none()
+      }
+      Message::CloseColumnMenu => {
+        self.column_menu = None;
+        Task::none()
+      }
+      Message::ToggleColumn(column) => {
+        self.settings.toggle_column(column);
+        self.settings.save();
+        Task::none()
+      }
     }
   }
 
@@ -1054,6 +1276,10 @@ impl Taguar {
       None => Space::new().into(),
     };
     layered = stack![layered, song_overlay].into();
+
+    if let Some(at) = self.column_menu {
+      layered = stack![layered, self.column_menu_view(at)].into();
+    }
     layered
   }
 
@@ -1097,6 +1323,7 @@ impl Taguar {
 
     stack![dismiss, positioned].into()
   }
+
   fn nav_warning_banner(&self) -> Element<'_, Message> {
     container(
       text(
@@ -1121,6 +1348,11 @@ impl Taguar {
         button(text("Reload").size(12))
           .on_press(Message::Reload)
           .padding([4, 10]),
+        // Push the column picker to the right edge of the toolbar.
+        Space::new().width(Length::Fill),
+        button(text("Columns").size(12))
+          .on_press(Message::ToggleColumnMenu)
+          .padding([4, 10]),
       ]
       .spacing(10)
       .align_y(Alignment::Center),
@@ -1132,30 +1364,28 @@ impl Taguar {
   }
 
   fn table_view(&self) -> Element<'_, Message> {
-    // Columns: Filename | Artist | Title | Comment
-    // Weights (proportional) — columns stretch to fill the available width.
-    let weights: [u16; 4] = [8, 4, 5, 6];
-    let headers = ["File Path", "Artist", "Title", "Comment"];
+    // Which columns to show is user-configurable (persisted in settings);
+    // rendering always follows the canonical `TableColumn::ALL` order. The
+    // proportional weights make the columns stretch to fill the width.
+    let columns: Vec<TableColumn> = TableColumn::ALL
+      .into_iter()
+      .filter(|c| self.settings.is_visible(*c))
+      .collect();
 
-    let header_cells: Vec<Element<Message>> = headers
-      .iter()
-      .zip(weights.iter())
-      .map(|(label, w)| {
-        text(*label)
+    let mut header_inner =
+      iced::widget::Row::new().spacing(10).padding([6, 10]);
+    for col in &columns {
+      header_inner = header_inner.push(
+        text(col.label())
           .size(12)
           .font(BOLD)
-          .width(Length::FillPortion(*w))
-          .color(MUTED)
-          .into()
-      })
-      .collect();
-    let header_row = container(
-      iced::widget::Row::with_children(header_cells)
-        .spacing(10)
-        .padding([6, 10]),
-    )
-    .width(Length::Fill)
-    .style(table_header_style);
+          .width(Length::FillPortion(col.weight()))
+          .color(MUTED),
+      );
+    }
+    let header_row = container(header_inner)
+      .width(Length::Fill)
+      .style(table_header_style);
 
     if self.loading {
       let body = container(text("Loading..."))
@@ -1175,21 +1405,14 @@ impl Taguar {
       let selected = self.selected_idx == Some(idx);
       let alt = idx % 2 == 1;
 
-      let cells = row![
-        text(info.filename.clone())
-          .size(12)
-          .width(Length::FillPortion(weights[0])),
-        text(info.artist.clone())
-          .size(12)
-          .width(Length::FillPortion(weights[1])),
-        text(info.title.clone())
-          .size(12)
-          .width(Length::FillPortion(weights[2])),
-        text(info.comment.clone())
-          .size(12)
-          .width(Length::FillPortion(weights[3])),
-      ]
-      .spacing(10);
+      let mut cells = iced::widget::Row::new().spacing(10);
+      for col in &columns {
+        cells = cells.push(
+          text(col.cell_text(info))
+            .size(12)
+            .width(Length::FillPortion(col.weight())),
+        );
+      }
 
       let style: fn(&Theme, button::Status) -> button::Style = if selected {
         selected_row_style
@@ -1201,11 +1424,14 @@ impl Taguar {
         plain_row_style
       };
 
-      button(cells)
+      let row_button = button(cells)
         .on_press(Message::FileSelected(idx))
         .width(Length::Fill)
         .padding([4, 10])
-        .style(style)
+        .style(style);
+
+      mouse_area(row_button)
+        .on_right_press(Message::OpenSongMenu(idx))
         .into()
     });
 
@@ -1214,6 +1440,46 @@ impl Taguar {
       .width(Length::Fill);
 
     column![header_row, body].into()
+  }
+
+  /// Floating dropdown listing every column with a checkbox for visibility.
+  /// Anchored to `at` (the cursor position when the button was clicked) so it
+  /// drops down just below the "Columns" button; a transparent full-window
+  /// scrim closes it on any outside click.
+  fn column_menu_view(&self, at: Point) -> Element<'_, Message> {
+    let mut items = Column::new().spacing(2);
+    for col in TableColumn::ALL {
+      items = items.push(
+        checkbox(self.settings.is_visible(col))
+          .label(col.label())
+          .on_toggle(move |_| Message::ToggleColumn(col))
+          .size(14)
+          .text_size(12),
+      );
+    }
+    let panel = container(items)
+      .padding(8)
+      .width(Length::Fixed(COLUMN_MENU_WIDTH))
+      .style(menu_panel_style);
+
+    let dismiss = mouse_area(
+      container(Space::new())
+        .width(Length::Fill)
+        .height(Length::Fill),
+    )
+    .on_press(Message::CloseColumnMenu)
+    .on_right_press(Message::CloseColumnMenu);
+
+    // Right-align the panel to the click so it stays on-screen (the button
+    // sits near the right edge), and drop it just below the toolbar.
+    let x = (at.x - COLUMN_MENU_WIDTH).max(0.0);
+    let y = at.y + 14.0;
+    let positioned = column![
+      Space::new().height(Length::Fixed(y)),
+      row![Space::new().width(Length::Fixed(x)), opaque(panel)],
+    ];
+
+    stack![dismiss, positioned].into()
   }
 
   fn sidebar_view(&self) -> Element<'_, Message> {
@@ -2321,28 +2587,52 @@ fn load_file_info(path: &Path) -> Result<FileInfo, String> {
   let props = tagged_file.properties();
   let duration = props.duration().as_secs();
 
-  let tag = editable_tag(&tagged_file);
-
-  let (title, artist, comment) = if let Some(t) = tag {
-    (
-      t.title().map(|s| s.to_string()).unwrap_or_default(),
-      t.artist().map(|s| s.to_string()).unwrap_or_default(),
-      t.comment().map(|s| s.to_string()).unwrap_or_default(),
-    )
-  }
-  else {
-    Default::default()
-  };
-
-  Ok(FileInfo {
+  let mut info = FileInfo {
     path: path.to_path_buf(),
     filename,
-    title,
-    artist,
-    comment,
     duration_secs: duration,
     size_bytes: size,
-  })
+    ..Default::default()
+  };
+
+  if let Some(t) = editable_tag(&tagged_file) {
+    info.title = t.title().map(|s| s.to_string()).unwrap_or_default();
+    info.artist = t.artist().map(|s| s.to_string()).unwrap_or_default();
+    info.album = t.album().map(|s| s.to_string()).unwrap_or_default();
+    info.comment = t.comment().map(|s| s.to_string()).unwrap_or_default();
+    info.genre = t
+      .genre()
+      .map(|s| {
+        s.split(';')
+          .map(|g| g.trim())
+          .collect::<Vec<_>>()
+          .join(", ")
+      })
+      .unwrap_or_default();
+    info.composer = t
+      .get_string(ItemKey::Composer)
+      .map(|s| s.to_string())
+      .unwrap_or_default();
+    info.arranger = t
+      .get_string(ItemKey::Arranger)
+      .map(|s| s.to_string())
+      .unwrap_or_default();
+    // Prefer the explicit release date (TDRL); fall back to the recording
+    // date (TDRC) so single-date files still populate the column.
+    info.release_date = t
+      .get_string(ItemKey::ReleaseDate)
+      .map(|s| s.to_string())
+      .or_else(|| t.date().map(|d| d.to_string()))
+      .unwrap_or_default();
+    // Join the (possibly multiple) non-empty descriptions for the column.
+    info.description = read_descriptions(t)
+      .into_iter()
+      .filter(|d| !d.is_empty())
+      .collect::<Vec<_>>()
+      .join("; ");
+  }
+
+  Ok(info)
 }
 
 fn editable_tag(tagged_file: &lofty::file::TaggedFile) -> Option<&Tag> {

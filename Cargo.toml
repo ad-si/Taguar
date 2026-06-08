@@ -18,6 +18,8 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 rodio = { version = "0.22", default-features = false, features = ["playback", "symphonia-all"] }
 opus = "0.3"
 ogg = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
 
 [profile.release]
 lto = true
