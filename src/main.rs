@@ -465,6 +465,8 @@ enum Message {
   LyricsAction(text_editor::Action),
   CompilationToggled(bool),
   PlayPauseToggle,
+  /// Stop playback of the current track and reset to the start.
+  PlaybackStop,
   Save,
   Saved(Result<(), String>),
   /// Discard any unsaved edits in the form, reverting to the last saved
@@ -832,6 +834,12 @@ impl Taguar {
             self.is_paused = false;
           }
         }
+        Task::none()
+      }
+      Message::PlaybackStop => {
+        playback_send(PlaybackCmd::Stop);
+        self.playing_path = None;
+        self.is_paused = false;
         Task::none()
       }
       Message::Save => self.spawn_save(PictureChange::None, "Saving..."),
@@ -1666,6 +1674,27 @@ impl Taguar {
       play_btn = play_btn.on_press(Message::PlayPauseToggle);
     }
 
+    // Stop button — shown only while the selected file is the active track
+    // (playing or paused), sitting next to the play/pause button.
+    let is_active = match (&self.playing_path, &selected_path) {
+      (Some(p), Some(s)) => p == s,
+      _ => false,
+    };
+    let mut playback_controls =
+      row![play_btn].spacing(8).align_y(Alignment::Center);
+    if is_active {
+      playback_controls = playback_controls.push(
+        button(
+          row![text("\u{23F9}").size(14), text("Stop").size(12)]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        )
+        .padding([4, 12])
+        .style(primary_button_style)
+        .on_press(Message::PlaybackStop),
+      );
+    }
+
     let selected_file = self.selected_idx.and_then(|i| self.files.get(i));
     let file_info_text = selected_file
       .map(|f| {
@@ -1687,10 +1716,13 @@ impl Taguar {
     let mut content = Column::new()
       .spacing(6)
       .push(
-        row![play_btn, text(file_info_text).size(11).color(MUTED),]
-          .spacing(12)
-          .align_y(Alignment::Center)
-          .padding([0, 0]),
+        row![
+          playback_controls,
+          text(file_info_text).size(11).color(MUTED),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center)
+        .padding([0, 0]),
       )
       .push(
         column![
