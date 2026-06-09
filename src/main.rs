@@ -568,11 +568,17 @@ enum Message {
   /// Move focus to the next/previous form field.
   FocusNextField,
   FocusPreviousField,
-  /// Emacs-style line navigation in the focused input/editor.
-  CursorLineStart,
-  CursorLineEnd,
+  /// Emacs-style line navigation in the focused input/editor. `select`
+  /// extends the selection (Shift held) instead of just moving the caret.
+  CursorLineStart {
+    select: bool,
+  },
+  CursorLineEnd {
+    select: bool,
+  },
   ApplyCursorMotion {
     to_end: bool,
+    select: bool,
     id: iced::widget::Id,
   },
   /// Clears all Album-section fields (album, album artist, track, disc,
@@ -723,31 +729,50 @@ impl Taguar {
       }
       Message::FocusNextField => iced::widget::operation::focus_next(),
       Message::FocusPreviousField => iced::widget::operation::focus_previous(),
-      Message::CursorLineStart => iced::advanced::widget::operate(
+      Message::CursorLineStart { select } => iced::advanced::widget::operate(
         iced::advanced::widget::operation::focusable::find_focused(),
       )
-      .map(|id| Message::ApplyCursorMotion { to_end: false, id }),
-      Message::CursorLineEnd => iced::advanced::widget::operate(
+      .map(move |id| Message::ApplyCursorMotion {
+        to_end: false,
+        select,
+        id,
+      }),
+      Message::CursorLineEnd { select } => iced::advanced::widget::operate(
         iced::advanced::widget::operation::focusable::find_focused(),
       )
-      .map(|id| Message::ApplyCursorMotion { to_end: true, id }),
-      Message::ApplyCursorMotion { to_end, id } => {
+      .map(move |id| Message::ApplyCursorMotion {
+        to_end: true,
+        select,
+        id,
+      }),
+      Message::ApplyCursorMotion { to_end, select, id } => {
         use iced::widget::text_editor::{Action, Motion};
         let motion = if to_end { Motion::End } else { Motion::Home };
+        let action = if select {
+          Action::Select(motion)
+        }
+        else {
+          Action::Move(motion)
+        };
         if id == iced::widget::Id::new("editor-lyrics") {
-          self.lyrics_content.perform(Action::Move(motion));
+          self.lyrics_content.perform(action);
           return Task::none();
         }
         if id == iced::widget::Id::new("editor-comment") {
-          self.comment_content.perform(Action::Move(motion));
+          self.comment_content.perform(action);
           return Task::none();
         }
         for (i, c) in self.description_contents.iter_mut().enumerate() {
           if id == iced::widget::Id::from(format!("editor-description-{i}")) {
-            c.perform(Action::Move(motion));
+            c.perform(action);
             return Task::none();
           }
         }
+        // Single-line text_input: iced's operation API exposes select_range but
+        // not the current caret, so a cursor-relative selection can't be
+        // anchored here. Shift therefore falls back to a plain caret move for
+        // these fields (the text_editor branches above handle real selection).
+        let _ = select;
         if to_end {
           iced::widget::operation::move_cursor_to_end(id)
         }
@@ -1267,14 +1292,15 @@ impl Taguar {
           ref key,
           modifiers,
           ..
-        }) if modifiers.control()
-          && !modifiers.shift()
-          && !modifiers.alt()
-          && !modifiers.logo() =>
-        {
+        }) if modifiers.control() && !modifiers.alt() && !modifiers.logo() => {
+          let select = modifiers.shift();
           match key.as_ref() {
-            keyboard::Key::Character("a") => Some(Message::CursorLineStart),
-            keyboard::Key::Character("e") => Some(Message::CursorLineEnd),
+            keyboard::Key::Character(c) if c.eq_ignore_ascii_case("a") => {
+              Some(Message::CursorLineStart { select })
+            }
+            keyboard::Key::Character(c) if c.eq_ignore_ascii_case("e") => {
+              Some(Message::CursorLineEnd { select })
+            }
             _ => None,
           }
         }
