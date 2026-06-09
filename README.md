@@ -16,6 +16,13 @@ ID3v2 / primary metadata tags. Built with [Iced](https://iced.rs/) and
   **Comment**; proportional columns that adapt to window size
 - Right-pane sidebar: compact form for Title, Artist, Album, Album Artist,
   Year, Track, Genre, Composer, Comment, Disc Number, Compilation flag
+- Artist, Album Artist, Genre and Composer support multiple values (per
+  ID3v2.4). A field stored as multiple entries is edited as pills (Enter or
+  comma adds one; a pill's `×`, or Backspace in the empty input, removes one).
+  A single value is shown as a plain text field — never auto-split — with a
+  **Split** button to convert it into separate entries when it contains a
+  `,`, `;` or `/`. Genuinely multi-entry fields also render as pills in the
+  left-pane table
 - Embedded cover art preview with dimensions, size, MIME and picture type
 - Read-only ID3v1 section shown when a file has an ID3v1 tag (ID3v1 is never
   written back)

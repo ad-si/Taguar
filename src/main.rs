@@ -2,7 +2,7 @@
 
 use iced::widget::{
   button, checkbox, column, container, image, mouse_area, opaque, row,
-  scrollable, stack, text, text_editor, text_input, Column, Space,
+  scrollable, stack, text, text_editor, text_input, Column, Row, Space,
 };
 use iced::{
   event, keyboard, mouse, Alignment, Background, Border, Color, Element, Event,
@@ -24,7 +24,9 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, OnceLock};
 use std::thread;
-use taguar::{apply_descriptions, read_descriptions};
+use taguar::{
+  apply_descriptions, apply_values, read_descriptions, read_values,
+};
 use walkdir::WalkDir;
 
 const AUDIO_EXTENSIONS: &[&str] = &[
@@ -168,15 +170,27 @@ impl TableColumn {
     }
   }
 
+  /// The multi-valued fields for this column, or `None` for single-valued
+  /// columns. Drives whether a table cell renders pills (>= 2 entries) or
+  /// plain text.
+  fn multi_values(self, info: &FileInfo) -> Option<&[String]> {
+    match self {
+      Self::Artist => Some(&info.artist),
+      Self::Genre => Some(&info.genre),
+      Self::Composer => Some(&info.composer),
+      _ => None,
+    }
+  }
+
   fn cell_text(self, info: &FileInfo) -> String {
     match self {
       Self::FilePath => info.filename.clone(),
-      Self::Artist => info.artist.clone(),
+      Self::Artist => info.artist.join(", "),
       Self::Title => info.title.clone(),
       Self::Album => info.album.clone(),
-      Self::Genre => info.genre.clone(),
+      Self::Genre => info.genre.join(", "),
       Self::ReleaseDate => info.release_date.clone(),
-      Self::Composer => info.composer.clone(),
+      Self::Composer => info.composer.join(", "),
       Self::Arranger => info.arranger.clone(),
       Self::Comment => info.comment.clone(),
       Self::Description => info.description.clone(),
@@ -301,7 +315,16 @@ struct Taguar {
   last_cursor: Option<Point>,
   /// Transient feedback shown in the modal header after a copy.
   copy_feedback: Option<String>,
-  genre_warning: Option<String>,
+  /// In-progress text for each pill field (Artist, Album Artist, Genre,
+  /// Composer) — the value typed but not yet committed to a pill.
+  artist_draft: String,
+  album_artist_draft: String,
+  genre_draft: String,
+  composer_draft: String,
+  /// Set when a draft edit just emptied a pill input, so the deferred
+  /// backspace handler doesn't mistake "deleted the last character" for
+  /// "backspace on an already-empty input" and remove a pill.
+  pill_backspace_suppressed: bool,
   /// Set when the user tried to switch songs with unsaved edits in the form.
   /// Cleared once the changes are saved or the user reloads the current
   /// song (clicking the same row re-reads from disk).
@@ -337,7 +360,11 @@ impl Default for Taguar {
       song_menu: None,
       last_cursor: None,
       copy_feedback: None,
-      genre_warning: None,
+      artist_draft: String::new(),
+      album_artist_draft: String::new(),
+      genre_draft: String::new(),
+      composer_draft: String::new(),
+      pill_backspace_suppressed: false,
       nav_warning: false,
       cover_modal_open: false,
       settings: Settings::load(),
@@ -380,13 +407,15 @@ struct FileInfo {
   path: PathBuf,
   filename: String,
   title: String,
-  artist: String,
+  // Multi-valued ID3v2.4 fields kept as separate entries so the table can
+  // render them as pills.
+  artist: Vec<String>,
   album: String,
   release_date: String,
-  genre: String,
+  genre: Vec<String>,
   comment: String,
   description: String,
-  composer: String,
+  composer: Vec<String>,
   arranger: String,
   duration_secs: u64,
   size_bytes: u64,
@@ -395,9 +424,10 @@ struct FileInfo {
 #[derive(Default, Clone, PartialEq)]
 struct TagForm {
   title: String,
-  artist: String,
+  // Multi-valued ID3v2.4 text fields, one entry per value (rendered as pills).
+  artist: Vec<String>,
   album: String,
-  album_artist: String,
+  album_artist: Vec<String>,
   date: String,
   // Some(_) only when the file's TDRC and TDRL differ; a second input then
   // appears in the form so both values can be edited independently.
@@ -408,11 +438,11 @@ struct TagForm {
   track_total: String,
   disc: String,
   disc_total: String,
-  genre: String,
+  genre: Vec<String>,
   audio_source: String,
   descriptions: Vec<String>,
   comment: String,
-  composer: String,
+  composer: Vec<String>,
   arranger: String,
   lyrics: String,
   compilation: bool,
@@ -426,9 +456,9 @@ impl TagForm {
   fn trimmed(&self) -> TagForm {
     TagForm {
       title: self.title.trim().to_string(),
-      artist: self.artist.trim().to_string(),
+      artist: trim_values(&self.artist),
       album: self.album.trim().to_string(),
-      album_artist: self.album_artist.trim().to_string(),
+      album_artist: trim_values(&self.album_artist),
       date: self.date.trim().to_string(),
       release_date: self.release_date.as_ref().map(|d| d.trim().to_string()),
       date_added: self.date_added.trim().to_string(),
@@ -436,7 +466,7 @@ impl TagForm {
       track_total: self.track_total.trim().to_string(),
       disc: self.disc.trim().to_string(),
       disc_total: self.disc_total.trim().to_string(),
-      genre: self.genre.trim().to_string(),
+      genre: trim_values(&self.genre),
       audio_source: self.audio_source.trim().to_string(),
       descriptions: self
         .descriptions
@@ -444,12 +474,82 @@ impl TagForm {
         .map(|d| d.trim().to_string())
         .collect(),
       comment: self.comment.trim().to_string(),
-      composer: self.composer.trim().to_string(),
+      composer: trim_values(&self.composer),
       arranger: self.arranger.trim().to_string(),
       lyrics: self.lyrics.trim_end().to_string(),
       compilation: self.compilation,
     }
   }
+}
+
+/// Trims each value and drops the ones that end up empty, so blanked pills
+/// aren't persisted.
+fn trim_values(values: &[String]) -> Vec<String> {
+  values
+    .iter()
+    .map(|v| v.trim().to_string())
+    .filter(|v| !v.is_empty())
+    .collect()
+}
+
+/// True when every entry is blank (or the list is empty) — used to decide
+/// whether an ID3v1 value may be copied into the ID3v2 counterpart.
+fn pills_blank(values: &[String]) -> bool {
+  values.iter().all(|v| v.trim().is_empty())
+}
+
+/// A multi-valued text field edited as a row of pills in the sidebar form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PillField {
+  Artist,
+  AlbumArtist,
+  Genre,
+  Composer,
+}
+
+impl PillField {
+  /// The widget id of this field's text input — also used to map keyboard
+  /// focus back to the field (see [`pill_field_for_id`]).
+  fn input_id(self) -> &'static str {
+    match self {
+      PillField::Artist => "artist",
+      PillField::AlbumArtist => "field-album-artist",
+      PillField::Genre => "field-genre",
+      PillField::Composer => "field-composer",
+    }
+  }
+}
+
+/// Separators the "Split" button breaks a single value on when converting it
+/// into multiple entries.
+const PILL_SEPARATORS: [char; 3] = [',', ';', '/'];
+
+/// Splits `text` into individual values on [`PILL_SEPARATORS`], trimming each
+/// and dropping blanks. Only invoked when the user explicitly converts a
+/// single value into multiple — values are never split automatically on read.
+fn split_into_values(text: &str) -> Vec<String> {
+  text
+    .split(PILL_SEPARATORS.as_slice())
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty())
+    .collect()
+}
+
+/// Whether `text` contains a separator the "Split" button could act on.
+fn has_pill_separator(text: &str) -> bool {
+  text.contains(PILL_SEPARATORS.as_slice())
+}
+
+/// Maps a focused widget id back to its pill field, if any.
+fn pill_field_for_id(id: &iced::widget::Id) -> Option<PillField> {
+  [
+    PillField::Artist,
+    PillField::AlbumArtist,
+    PillField::Genre,
+    PillField::Composer,
+  ]
+  .into_iter()
+  .find(|f| *id == iced::widget::Id::new(f.input_id()))
 }
 
 /// Identifies which ID3v1 field a "copy to ID3v2" button targets.
@@ -494,21 +594,33 @@ enum Message {
   FileSelected(usize),
   TitleChanged(String),
   TitleFromFilename,
-  ArtistChanged(String),
   AlbumChanged(String),
-  AlbumArtistChanged(String),
   DateChanged(String),
   ReleaseDateChanged(String),
   DateAddedChanged(String),
   TrackChanged(String),
   DiscChanged(String),
-  GenreChanged(String),
   AudioSourceChanged(String),
   AudioSourceOpenUrl(String),
   CommentAction(text_editor::Action),
   DescriptionAction(usize, text_editor::Action),
-  ComposerChanged(String),
   ArrangerChanged(String),
+  /// Edited a multi-valued field that's currently stored as a single value
+  /// (or empty) — kept as a plain string, not split into pills.
+  SingleFieldChanged(PillField, String),
+  /// Convert a single value containing separators into multiple pill entries.
+  PillSplit(PillField),
+  /// Typed text changed in a pill field's input; commits any comma-separated
+  /// complete segments and keeps the remainder as the draft.
+  PillDraftChanged(PillField, String),
+  /// Enter pressed in a pill field — commits the current draft as a pill.
+  PillSubmit(PillField),
+  /// The pill's `×` button was clicked — removes that value.
+  PillRemove(PillField, usize),
+  /// Backspace pressed; if the focused pill field's draft is empty, drops its
+  /// last pill. Resolved against the focused widget id.
+  PillBackspace,
+  PillBackspaceResolve(iced::widget::Id),
   LyricsAction(text_editor::Action),
   CompilationToggled(bool),
   PlayPauseToggle,
@@ -624,6 +736,7 @@ impl Taguar {
         self.nav_warning = false;
         self.form = TagForm::default();
         self.saved_form = TagForm::default();
+        self.clear_pill_drafts();
         self.lyrics_content = text_editor::Content::new();
         self.comment_content = text_editor::Content::new();
         self.description_contents = Vec::new();
@@ -652,6 +765,7 @@ impl Taguar {
           self.nav_warning = false;
           self.form = TagForm::default();
           self.saved_form = TagForm::default();
+          self.clear_pill_drafts();
           self.lyrics_content = text_editor::Content::new();
           self.description_contents = Vec::new();
           self.id3v1 = None;
@@ -679,7 +793,7 @@ impl Taguar {
         Task::none()
       }
       Message::FileSelected(idx) => {
-        if self.selected_idx != Some(idx) && self.form != self.saved_form {
+        if self.selected_idx != Some(idx) && self.is_dirty() {
           self.nav_warning = true;
           return Task::none();
         }
@@ -695,6 +809,7 @@ impl Taguar {
             .collect();
           self.form = form.clone();
           self.saved_form = form;
+          self.clear_pill_drafts();
           self.id3v1 = id3v1;
           self.primary_tag_label = label;
           self.cover = cover;
@@ -783,6 +898,7 @@ impl Taguar {
       Message::AlbumClear => {
         self.form.album.clear();
         self.form.album_artist.clear();
+        self.album_artist_draft.clear();
         self.form.track.clear();
         self.form.track_total.clear();
         self.form.disc.clear();
@@ -794,11 +910,11 @@ impl Taguar {
         if let Some(v1) = &self.id3v1 {
           match field {
             Id3v1Field::Title => self.form.title = v1.title.clone(),
-            Id3v1Field::Artist => self.form.artist = v1.artist.clone(),
+            Id3v1Field::Artist => self.form.artist = vec![v1.artist.clone()],
             Id3v1Field::Album => self.form.album = v1.album.clone(),
             Id3v1Field::Year => self.form.date = v1.year.clone(),
             Id3v1Field::Track => self.form.track = v1.track.clone(),
-            Id3v1Field::Genre => self.form.genre = v1.genre.clone(),
+            Id3v1Field::Genre => self.form.genre = vec![v1.genre.clone()],
             Id3v1Field::Comment => {
               self.form.comment = v1.comment.clone();
               self.comment_content =
@@ -812,8 +928,8 @@ impl Taguar {
         if let Some(v1) = self.id3v1.clone() {
           // Only fill empty ID3v2 fields so existing values are never
           // clobbered, matching the per-field copy buttons.
-          if self.form.artist.trim().is_empty() {
-            self.form.artist = v1.artist;
+          if pills_blank(&self.form.artist) && !v1.artist.is_empty() {
+            self.form.artist = vec![v1.artist];
           }
           if self.form.title.trim().is_empty() {
             self.form.title = v1.title;
@@ -827,8 +943,8 @@ impl Taguar {
           if self.form.track.trim().is_empty() {
             self.form.track = v1.track;
           }
-          if self.form.genre.trim().is_empty() {
-            self.form.genre = v1.genre;
+          if pills_blank(&self.form.genre) && !v1.genre.is_empty() {
+            self.form.genre = vec![v1.genre];
           }
           if self.form.comment.trim().is_empty() {
             self.form.comment = v1.comment.clone();
@@ -849,16 +965,8 @@ impl Taguar {
         }
         Task::none()
       }
-      Message::ArtistChanged(v) => {
-        self.form.artist = v;
-        Task::none()
-      }
       Message::AlbumChanged(v) => {
         self.form.album = v;
-        Task::none()
-      }
-      Message::AlbumArtistChanged(v) => {
-        self.form.album_artist = v;
         Task::none()
       }
       Message::DateChanged(v) => {
@@ -881,14 +989,55 @@ impl Taguar {
         self.form.disc = v;
         Task::none()
       }
-      Message::GenreChanged(v) => {
-        self.genre_warning = if v.contains(';') || v.contains('/') {
-          Some("Use commas to separate genres".into())
+      Message::SingleFieldChanged(field, value) => {
+        // Stored as a single string (no auto-splitting); empty clears it.
+        let pills = self.pill_values_mut(field);
+        pills.clear();
+        if !value.is_empty() {
+          pills.push(value);
         }
-        else {
-          None
-        };
-        self.form.genre = v;
+        Task::none()
+      }
+      Message::PillSplit(field) => {
+        let current =
+          self.pill_values(field).first().cloned().unwrap_or_default();
+        *self.pill_values_mut(field) = split_into_values(&current);
+        Task::none()
+      }
+      Message::PillDraftChanged(field, value) => {
+        self.pill_draft_changed(field, value);
+        Task::none()
+      }
+      Message::PillSubmit(field) => {
+        self.commit_pill_draft(field);
+        Task::none()
+      }
+      Message::PillRemove(field, idx) => {
+        let pills = self.pill_values_mut(field);
+        if idx < pills.len() {
+          pills.remove(idx);
+        }
+        Task::none()
+      }
+      Message::PillBackspace => iced::advanced::widget::operate(
+        iced::advanced::widget::operation::focusable::find_focused(),
+      )
+      .map(Message::PillBackspaceResolve),
+      Message::PillBackspaceResolve(id) => {
+        // Runs after the keystroke's draft edit (it arrives via an `operate`
+        // round-trip), so an empty draft here without suppression means the
+        // input was already empty: drop the preceding pill.
+        if let Some(field) = pill_field_for_id(&id) {
+          // Only act in pills mode (>= 2 entries); a single value is edited as
+          // a plain string and must not be cleared by Backspace.
+          if self.pill_values(field).len() >= 2
+            && self.pill_draft(field).is_empty()
+            && !self.pill_backspace_suppressed
+          {
+            self.pill_values_mut(field).pop();
+          }
+        }
+        self.pill_backspace_suppressed = false;
         Task::none()
       }
       Message::AudioSourceChanged(v) => {
@@ -921,10 +1070,6 @@ impl Taguar {
             }
           }
         }
-        Task::none()
-      }
-      Message::ComposerChanged(v) => {
-        self.form.composer = v;
         Task::none()
       }
       Message::ArrangerChanged(v) => {
@@ -991,6 +1136,7 @@ impl Taguar {
             .collect();
           self.form = form.clone();
           self.saved_form = form;
+          self.clear_pill_drafts();
           self.id3v1 = id3v1;
           self.primary_tag_label = label;
           self.cover = cover;
@@ -1014,6 +1160,7 @@ impl Taguar {
       }
       Message::Reset => {
         self.form = self.saved_form.clone();
+        self.clear_pill_drafts();
         self.lyrics_content =
           text_editor::Content::with_text(&self.saved_form.lyrics);
         self.comment_content =
@@ -1288,6 +1435,16 @@ impl Taguar {
           key: keyboard::Key::Named(keyboard::key::Named::Escape),
           ..
         }) => Some(Message::HideCoverModal),
+        // Backspace in an empty pill input deletes the preceding pill. The
+        // focused field (and whether its draft is empty) is resolved in the
+        // handler; for every other widget this is a no-op.
+        Event::Keyboard(keyboard::Event::KeyPressed {
+          key: keyboard::Key::Named(keyboard::key::Named::Backspace),
+          modifiers,
+          ..
+        }) if !modifiers.control() && !modifiers.alt() && !modifiers.logo() => {
+          Some(Message::PillBackspace)
+        }
         Event::Keyboard(keyboard::Event::KeyPressed {
           ref key,
           modifiers,
@@ -1328,11 +1485,172 @@ impl Taguar {
 
   /// Kicks off a background save that applies the current form plus an
   /// optional picture change, reporting completion via [`Message::Saved`].
+  fn pill_values(&self, field: PillField) -> &Vec<String> {
+    match field {
+      PillField::Artist => &self.form.artist,
+      PillField::AlbumArtist => &self.form.album_artist,
+      PillField::Genre => &self.form.genre,
+      PillField::Composer => &self.form.composer,
+    }
+  }
+
+  fn pill_values_mut(&mut self, field: PillField) -> &mut Vec<String> {
+    match field {
+      PillField::Artist => &mut self.form.artist,
+      PillField::AlbumArtist => &mut self.form.album_artist,
+      PillField::Genre => &mut self.form.genre,
+      PillField::Composer => &mut self.form.composer,
+    }
+  }
+
+  fn pill_draft(&self, field: PillField) -> &str {
+    match field {
+      PillField::Artist => &self.artist_draft,
+      PillField::AlbumArtist => &self.album_artist_draft,
+      PillField::Genre => &self.genre_draft,
+      PillField::Composer => &self.composer_draft,
+    }
+  }
+
+  fn pill_draft_mut(&mut self, field: PillField) -> &mut String {
+    match field {
+      PillField::Artist => &mut self.artist_draft,
+      PillField::AlbumArtist => &mut self.album_artist_draft,
+      PillField::Genre => &mut self.genre_draft,
+      PillField::Composer => &mut self.composer_draft,
+    }
+  }
+
+  /// Pushes `text` as a single pill onto `field` (trimmed), if non-empty.
+  /// Separators inside `text` are kept verbatim — only the explicit "Split"
+  /// button breaks a value into multiple entries.
+  fn commit_pill_text(&mut self, field: PillField, text: &str) {
+    let trimmed = text.trim();
+    if !trimmed.is_empty() {
+      self.pill_values_mut(field).push(trimmed.to_string());
+    }
+  }
+
+  /// Commits the current draft as one or more pills and clears the draft.
+  fn commit_pill_draft(&mut self, field: PillField) {
+    let text = std::mem::take(self.pill_draft_mut(field));
+    self.commit_pill_text(field, &text);
+  }
+
+  /// Handles typed input: any complete comma-separated segment becomes a pill,
+  /// and the trailing fragment stays in the draft for further typing.
+  fn pill_draft_changed(&mut self, field: PillField, value: String) {
+    if let Some(last_comma) = value.rfind(',') {
+      let (committed, remainder) = value.split_at(last_comma);
+      for segment in committed.split(',') {
+        self.commit_pill_text(field, segment);
+      }
+      // `remainder` still starts with the comma; drop it.
+      *self.pill_draft_mut(field) = remainder[1..].trim_start().to_string();
+    }
+    else {
+      *self.pill_draft_mut(field) = value;
+    }
+    // If this edit left the input empty, the same keystroke must not also pop
+    // a pill (the user was deleting a character, not the preceding pill).
+    self.pill_backspace_suppressed = self.pill_draft(field).is_empty();
+  }
+
+  /// Folds every non-empty pill draft into its pill list. Called before a save
+  /// so text typed but not yet committed isn't lost.
+  fn commit_pill_drafts(&mut self) {
+    for field in [
+      PillField::Artist,
+      PillField::AlbumArtist,
+      PillField::Genre,
+      PillField::Composer,
+    ] {
+      self.commit_pill_draft(field);
+    }
+  }
+
+  fn clear_pill_drafts(&mut self) {
+    self.artist_draft.clear();
+    self.album_artist_draft.clear();
+    self.genre_draft.clear();
+    self.composer_draft.clear();
+    self.pill_backspace_suppressed = false;
+  }
+
+  fn has_pending_pill_drafts(&self) -> bool {
+    [
+      &self.artist_draft,
+      &self.album_artist_draft,
+      &self.genre_draft,
+      &self.composer_draft,
+    ]
+    .iter()
+    .any(|d| !d.trim().is_empty())
+  }
+
+  /// True when the form differs from the last saved snapshot, including any
+  /// uncommitted pill draft.
+  fn is_dirty(&self) -> bool {
+    self.form != self.saved_form || self.has_pending_pill_drafts()
+  }
+
+  /// Renders a multi-valued field. With two or more stored entries it shows a
+  /// wrapping row of pills plus an input (Enter or comma adds a pill); with a
+  /// single value (or none) it shows a plain text input, plus a "Split" button
+  /// when that value contains a separator that could break it into entries.
+  fn pill_input_view(
+    &self,
+    label_text: &'static str,
+    field: PillField,
+  ) -> Element<'_, Message> {
+    let label = text(label_text).size(11).color(MUTED);
+    let pills = self.pill_values(field);
+    if pills.len() >= 2 {
+      let mut wrap = Row::new().spacing(4).align_y(Alignment::Center);
+      for (idx, value) in pills.iter().enumerate() {
+        wrap = wrap.push(pill_chip(value, field, idx));
+      }
+      wrap = wrap.push(
+        text_input("", self.pill_draft(field))
+          .id(iced::widget::Id::new(field.input_id()))
+          .on_input(move |v| Message::PillDraftChanged(field, v))
+          .on_submit(Message::PillSubmit(field))
+          .size(12)
+          .padding(4)
+          .width(Length::Fixed(130.0)),
+      );
+      return column![label, wrap.wrap()].spacing(2).into();
+    }
+
+    let value = pills.first().map(String::as_str).unwrap_or("");
+    let input = text_input("", value)
+      .id(iced::widget::Id::new(field.input_id()))
+      .on_input(move |v| Message::SingleFieldChanged(field, v))
+      .size(12)
+      .padding(4);
+    let body: Element<Message> = if has_pill_separator(value) {
+      row![
+        input,
+        button(text("Split").size(11))
+          .on_press(Message::PillSplit(field))
+          .padding([4, 8]),
+      ]
+      .spacing(4)
+      .align_y(Alignment::Center)
+      .into()
+    }
+    else {
+      input.into()
+    };
+    column![label, body].spacing(2).into()
+  }
+
   fn spawn_save(
     &mut self,
     pic_change: PictureChange,
     status: &str,
   ) -> Task<Message> {
+    self.commit_pill_drafts();
     let Some(idx) = self.selected_idx else {
       return Task::none();
     };
@@ -1541,11 +1859,12 @@ impl Taguar {
 
       let mut cells = iced::widget::Row::new().spacing(10);
       for col in &columns {
-        cells = cells.push(
-          text(col.cell_text(info))
-            .size(12)
-            .width(Length::FillPortion(col.weight())),
-        );
+        let cell: Element<Message> = match col.multi_values(info) {
+          Some(values) => table_value_view(values),
+          None => text(col.cell_text(info)).size(12).into(),
+        };
+        cells =
+          cells.push(container(cell).width(Length::FillPortion(col.weight())));
       }
 
       let style: fn(&Theme, button::Status) -> button::Style = if selected {
@@ -1643,38 +1962,16 @@ impl Taguar {
     else {
       "Release Date:"
     };
-    let year_genre = row![
-      column![
-        label(date_label),
-        text_input("YYYY[-MM[-DD]]", &form.date)
-          .id(iced::widget::Id::new("field-date"))
-          .on_input(Message::DateChanged)
-          .size(12)
-          .padding(4)
-          .width(Length::Fixed(110.0)),
-      ]
-      .spacing(2),
-      {
-        let mut col = column![
-          label("Genre:"),
-          text_input("Pop, Rock, Alt", &form.genre)
-            .id(iced::widget::Id::new("field-genre"))
-            .on_input(Message::GenreChanged)
-            .size(12)
-            .padding(4),
-        ]
-        .spacing(2);
-        if let Some(warn) = &self.genre_warning {
-          col = col.push(
-            text(warn.as_str())
-              .size(10)
-              .color(Color::from_rgb(0.85, 0.2, 0.2)),
-          );
-        }
-        col
-      },
+    let date_field = column![
+      label(date_label),
+      text_input("YYYY[-MM[-DD]]", &form.date)
+        .id(iced::widget::Id::new("field-date"))
+        .on_input(Message::DateChanged)
+        .size(12)
+        .padding(4)
+        .width(Length::Fixed(110.0)),
     ]
-    .spacing(6);
+    .spacing(2);
 
     let album_track_disc = row![
       column![
@@ -1733,11 +2030,7 @@ impl Taguar {
       column![
         album_header,
         field("Album:", &form.album, Message::AlbumChanged),
-        field(
-          "Album Artist:",
-          &form.album_artist,
-          Message::AlbumArtistChanged,
-        ),
+        self.pill_input_view("Album Artist:", PillField::AlbumArtist),
         album_track_disc,
       ]
       .spacing(6),
@@ -1748,8 +2041,8 @@ impl Taguar {
     let save_btn = button(text("Save").size(12))
       .padding([4, 14])
       .style(primary_button_style);
-    let has_unsaved = self.form != self.saved_form;
-    let save_btn = if has_unsaved && self.genre_warning.is_none() {
+    let has_unsaved = self.is_dirty();
+    let save_btn = if has_unsaved {
       save_btn.on_press(Message::Save)
     }
     else {
@@ -1850,17 +2143,7 @@ impl Taguar {
         .align_y(Alignment::Center)
         .padding([0, 0]),
       )
-      .push(
-        column![
-          label("Artist:"),
-          text_input("", &form.artist)
-            .id(iced::widget::Id::new("artist"))
-            .on_input(Message::ArtistChanged)
-            .size(12)
-            .padding(4),
-        ]
-        .spacing(2),
-      )
+      .push(self.pill_input_view("Artist:", PillField::Artist))
       .push({
         let input = text_input("", &form.title)
           .id(iced::widget::Id::new("Title:"))
@@ -1886,7 +2169,8 @@ impl Taguar {
         };
         column![label("Title:"), input_row].spacing(2)
       })
-      .push(year_genre);
+      .push(date_field)
+      .push(self.pill_input_view("Genre:", PillField::Genre));
     if let Some(rd) = &form.release_date {
       content = content.push(field(
         "Release Date (TDRL):",
@@ -1997,7 +2281,7 @@ impl Taguar {
     }
     content = content
       .push(comment_field)
-      .push(field("Composer:", &form.composer, Message::ComposerChanged))
+      .push(self.pill_input_view("Composer:", PillField::Composer))
       .push(field("Arranger:", &form.arranger, Message::ArrangerChanged))
       .push(lyrics_field)
       .push(Space::new().height(14))
@@ -2132,7 +2416,7 @@ impl Taguar {
         (
           "Artist",
           &v1.artist,
-          form.artist.trim().is_empty(),
+          pills_blank(&form.artist),
           Id3v1Field::Artist,
         ),
         (
@@ -2162,7 +2446,7 @@ impl Taguar {
         (
           "Genre",
           &v1.genre,
-          form.genre.trim().is_empty(),
+          pills_blank(&form.genre),
           Id3v1Field::Genre,
         ),
         (
@@ -2550,6 +2834,86 @@ fn fieldset_style(_theme: &Theme) -> container::Style {
   }
 }
 
+/// A single committed value rendered as a rounded chip with an `×` button.
+fn pill_chip(
+  value: &str,
+  field: PillField,
+  idx: usize,
+) -> Element<'static, Message> {
+  container(
+    row![
+      text(value.to_string()).size(11),
+      button(text("\u{00D7}").size(12))
+        .on_press(Message::PillRemove(field, idx))
+        .padding([0, 4])
+        .style(pill_remove_button_style),
+    ]
+    .spacing(2)
+    .align_y(Alignment::Center),
+  )
+  .padding([1, 7])
+  .style(pill_style)
+  .into()
+}
+
+/// A read-only chip (no remove button) used to show a single value in a
+/// table cell. The text color is pinned dark so it stays readable on the
+/// light chip background even when the row is selected (which otherwise turns
+/// inherited text white).
+fn read_only_chip(value: &str) -> Element<'static, Message> {
+  container(text(value.to_string()).size(11).color(Color::BLACK))
+    .padding([1, 7])
+    .style(pill_style)
+    .into()
+}
+
+/// Renders a table cell for a multi-valued field: a wrapping row of read-only
+/// chips when there are two or more entries, otherwise plain text.
+fn table_value_view(values: &[String]) -> Element<'_, Message> {
+  if values.len() >= 2 {
+    let mut wrap = Row::new().spacing(4).align_y(Alignment::Center);
+    for value in values {
+      wrap = wrap.push(read_only_chip(value));
+    }
+    wrap.wrap().into()
+  }
+  else {
+    text(values.first().cloned().unwrap_or_default())
+      .size(12)
+      .into()
+  }
+}
+
+fn pill_style(_theme: &Theme) -> container::Style {
+  container::Style {
+    background: Some(Background::Color(ROW_ALT)),
+    border: Border {
+      color: BORDER,
+      width: 1.0,
+      radius: 8.0.into(),
+    },
+    ..container::Style::default()
+  }
+}
+
+fn pill_remove_button_style(
+  _theme: &Theme,
+  status: button::Status,
+) -> button::Style {
+  let text_color = match status {
+    button::Status::Hovered | button::Status::Pressed => {
+      Color::from_rgb(0.85, 0.2, 0.2)
+    }
+    _ => MUTED,
+  };
+  button::Style {
+    background: None,
+    text_color,
+    border: Border::default(),
+    ..button::Style::default()
+  }
+}
+
 fn selected_row_style(_theme: &Theme, status: button::Status) -> button::Style {
   let bg = match status {
     button::Status::Hovered | button::Status::Pressed => ORANGE_DARK,
@@ -2894,22 +3258,12 @@ fn load_file_info(path: &Path) -> Result<FileInfo, String> {
 
   if let Some(t) = editable_tag(&tagged_file) {
     info.title = t.title().map(|s| s.to_string()).unwrap_or_default();
-    info.artist = t.artist().map(|s| s.to_string()).unwrap_or_default();
+    // Join multi-valued fields with ", " for the (single-line) table columns.
+    info.artist = read_values(t, ItemKey::TrackArtist);
     info.album = t.album().map(|s| s.to_string()).unwrap_or_default();
     info.comment = t.comment().map(|s| s.to_string()).unwrap_or_default();
-    info.genre = t
-      .genre()
-      .map(|s| {
-        s.split(';')
-          .map(|g| g.trim())
-          .collect::<Vec<_>>()
-          .join(", ")
-      })
-      .unwrap_or_default();
-    info.composer = t
-      .get_string(ItemKey::Composer)
-      .map(|s| s.to_string())
-      .unwrap_or_default();
+    info.genre = read_values(t, ItemKey::Genre);
+    info.composer = read_values(t, ItemKey::Composer);
     info.arranger = t
       .get_string(ItemKey::Arranger)
       .map(|s| s.to_string())
@@ -2968,12 +3322,9 @@ fn load_full(
   if let Some(tag) = editable_tag(&tagged_file) {
     label = tag_type_label(tag.tag_type()).to_string();
     form.title = tag.title().map(|s| s.to_string()).unwrap_or_default();
-    form.artist = tag.artist().map(|s| s.to_string()).unwrap_or_default();
+    form.artist = read_values(tag, ItemKey::TrackArtist);
     form.album = tag.album().map(|s| s.to_string()).unwrap_or_default();
-    form.album_artist = tag
-      .get_string(ItemKey::AlbumArtist)
-      .map(|s| s.to_string())
-      .unwrap_or_default();
+    form.album_artist = read_values(tag, ItemKey::AlbumArtist);
     let tdrc = tag.date();
     let tdrl = tag
       .get_string(ItemKey::ReleaseDate)
@@ -2998,21 +3349,10 @@ fn load_full(
     form.disc = tag.disk().map(|d| d.to_string()).unwrap_or_default();
     form.disc_total =
       tag.disk_total().map(|d| d.to_string()).unwrap_or_default();
-    form.genre = tag
-      .genre()
-      .map(|s| {
-        s.split(';')
-          .map(|g| g.trim())
-          .collect::<Vec<_>>()
-          .join(", ")
-      })
-      .unwrap_or_default();
+    form.genre = read_values(tag, ItemKey::Genre);
     form.comment = tag.comment().map(|s| s.to_string()).unwrap_or_default();
     form.descriptions = read_descriptions(tag);
-    form.composer = tag
-      .get_string(ItemKey::Composer)
-      .map(|s| s.to_string())
-      .unwrap_or_default();
+    form.composer = read_values(tag, ItemKey::Composer);
     form.arranger = tag
       .get_string(ItemKey::Arranger)
       .map(|s| s.to_string())
@@ -3280,25 +3620,20 @@ fn save_tags(
   set_or_remove_string(&mut tag, ItemKey::TrackTitle, &form.title, |t, v| {
     t.set_title(v)
   });
-  set_or_remove_string(&mut tag, ItemKey::TrackArtist, &form.artist, |t, v| {
-    t.set_artist(v)
-  });
   set_or_remove_string(&mut tag, ItemKey::AlbumTitle, &form.album, |t, v| {
     t.set_album(v)
-  });
-  let genre_stored = form
-    .genre
-    .split(',')
-    .map(|g| g.trim())
-    .filter(|g| !g.is_empty())
-    .collect::<Vec<_>>()
-    .join(";");
-  set_or_remove_string(&mut tag, ItemKey::Genre, &genre_stored, |t, v| {
-    t.set_genre(v)
   });
   set_or_remove_string(&mut tag, ItemKey::Comment, &form.comment, |t, v| {
     t.set_comment(v)
   });
+
+  // Multi-valued ID3v2.4 fields: each value becomes its own item, joined into
+  // one null-separated frame on save (and the native multi-value form for
+  // other tag types).
+  apply_values(&mut tag, ItemKey::TrackArtist, &form.artist);
+  apply_values(&mut tag, ItemKey::Genre, &form.genre);
+  apply_values(&mut tag, ItemKey::AlbumArtist, &form.album_artist);
+  apply_values(&mut tag, ItemKey::Composer, &form.composer);
 
   apply_descriptions(&mut tag, &form.descriptions);
 
@@ -3307,8 +3642,6 @@ fn save_tags(
   // lofty's per-format conversion (e.g. ID3v2's TIPL routing for Arranger);
   // a post-save round-trip check then surfaces any value the target format
   // can't represent.
-  put_or_remove(&mut tag, ItemKey::AlbumArtist, &form.album_artist);
-  put_or_remove(&mut tag, ItemKey::Composer, &form.composer);
   put_or_remove(&mut tag, ItemKey::Arranger, &form.arranger);
 
   let lyrics = form.lyrics.clone();
@@ -3398,6 +3731,25 @@ fn save_tags(
   Ok(())
 }
 
+/// True when a non-empty expected value didn't round-trip to `actual`.
+fn value_missing(expected: &str, actual: Option<&str>) -> bool {
+  !expected.is_empty() && actual.unwrap_or("") != expected
+}
+
+/// True when the non-empty expected values didn't round-trip to `actual` (in
+/// the same order). An empty expectation never counts as missing.
+fn values_missing(expected: &[String], actual: &[String]) -> bool {
+  let expected: Vec<&str> = expected
+    .iter()
+    .map(String::as_str)
+    .filter(|s| !s.is_empty())
+    .collect();
+  if expected.is_empty() {
+    return false;
+  }
+  actual.iter().map(String::as_str).collect::<Vec<_>>() != expected
+}
+
 /// Re-reads the file after save and confirms every non-empty form field
 /// round-tripped. Surfaces a clear error rather than silently losing data
 /// when the target format can't represent a value (e.g. AIFF Text / RIFF
@@ -3415,34 +3767,37 @@ fn verify_saved(
     .ok_or_else(|| "Saved tag not found on disk".to_string())?;
 
   let mut missing: Vec<&str> = Vec::new();
-  let mut check = |name: &'static str, expected: &str, actual: Option<&str>| {
-    if !expected.is_empty() && actual.unwrap_or("") != expected {
-      missing.push(name);
-    }
-  };
-  check("Title", &form.title, tag.title().as_deref());
-  check("Artist", &form.artist, tag.artist().as_deref());
-  check("Album", &form.album, tag.album().as_deref());
-  check(
-    "Album Artist",
-    &form.album_artist,
-    tag.get_string(ItemKey::AlbumArtist),
-  );
-  check(
-    "Composer",
-    &form.composer,
-    tag.get_string(ItemKey::Composer),
-  );
-  check(
-    "Arranger",
-    &form.arranger,
-    tag.get_string(ItemKey::Arranger),
-  );
-  check("Comment", &form.comment, tag.comment().as_deref());
+  if value_missing(&form.title, tag.title().as_deref()) {
+    missing.push("Title");
+  }
+  if values_missing(&form.artist, &read_values(tag, ItemKey::TrackArtist)) {
+    missing.push("Artist");
+  }
+  if value_missing(&form.album, tag.album().as_deref()) {
+    missing.push("Album");
+  }
+  if values_missing(&form.album_artist, &read_values(tag, ItemKey::AlbumArtist))
+  {
+    missing.push("Album Artist");
+  }
+  if values_missing(&form.genre, &read_values(tag, ItemKey::Genre)) {
+    missing.push("Genre");
+  }
+  if values_missing(&form.composer, &read_values(tag, ItemKey::Composer)) {
+    missing.push("Composer");
+  }
+  if value_missing(&form.arranger, tag.get_string(ItemKey::Arranger)) {
+    missing.push("Arranger");
+  }
+  if value_missing(&form.comment, tag.comment().as_deref()) {
+    missing.push("Comment");
+  }
   let lyrics_actual = tag
     .get_string(ItemKey::Lyrics)
     .or_else(|| tag.get_string(ItemKey::UnsyncLyrics));
-  check("Lyrics", form.lyrics.trim_end(), lyrics_actual);
+  if value_missing(form.lyrics.trim_end(), lyrics_actual) {
+    missing.push("Lyrics");
+  }
   if form.compilation && tag.get_string(ItemKey::FlagCompilation).is_none() {
     missing.push("Compilation");
   }

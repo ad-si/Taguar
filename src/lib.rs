@@ -35,6 +35,29 @@ pub fn apply_descriptions(tag: &mut Tag, descriptions: &[String]) {
   }
 }
 
+/// Returns every value present for `key` on the tag, in source order. For
+/// ID3v2.4 lofty splits a multi-value text frame (null-separated) into one
+/// entry per value, so this yields each artist, genre, etc. separately.
+/// Returns an empty `Vec` when the key is absent.
+pub fn read_values(tag: &Tag, key: ItemKey) -> Vec<String> {
+  tag.get_strings(key).map(|s| s.to_string()).collect()
+}
+
+/// Replaces all items for `key` with `values`, skipping empty ones. Each
+/// value becomes its own `TagItem`; on save lofty joins same-key items into a
+/// single ID3v2.4 frame separated by `\0` (and writes them as the format's
+/// native multi-value representation for FLAC / OGG / M4A). Uses
+/// `push_unchecked` so values reach lofty's per-format conversion; callers
+/// should verify the write afterwards.
+pub fn apply_values(tag: &mut Tag, key: ItemKey, values: &[String]) {
+  tag.remove_key(key);
+  for value in values {
+    if !value.is_empty() {
+      tag.push_unchecked(TagItem::new(key, ItemValue::Text(value.clone())));
+    }
+  }
+}
+
 /// Reads descriptions directly from an audio file at `path`. Skips ID3v1
 /// since it has no Description concept; otherwise uses the first non-v1 tag
 /// (or the primary tag).
@@ -65,6 +88,46 @@ pub fn write_descriptions_to_path(
     None => Tag::new(tagged.primary_tag_type()),
   };
   apply_descriptions(&mut tag, descriptions);
+  tag
+    .save_to_path(path, WriteOptions::default())
+    .map_err(|e| e.to_string())
+}
+
+/// Reads every value for `key` from the file's primary tag (excluding ID3v1).
+/// For ID3v2.4 this returns each null-separated value of the text frame
+/// separately.
+pub fn read_values_from_path(
+  path: &Path,
+  key: ItemKey,
+) -> Result<Vec<String>, String> {
+  let tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
+  let tag = tagged
+    .tags()
+    .iter()
+    .find(|t| t.tag_type() != TagType::Id3v1)
+    .or_else(|| tagged.primary_tag());
+  Ok(tag.map(|t| read_values(t, key)).unwrap_or_default())
+}
+
+/// Writes `values` for `key` to the file's primary tag (excluding ID3v1),
+/// replacing any existing items. Empty entries are dropped; for ID3v2.4 the
+/// values are stored as a single null-separated text frame.
+pub fn write_values_to_path(
+  path: &Path,
+  key: ItemKey,
+  values: &[String],
+) -> Result<(), String> {
+  let tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
+  let mut tag = match tagged
+    .tags()
+    .iter()
+    .find(|t| t.tag_type() != TagType::Id3v1)
+    .cloned()
+  {
+    Some(t) => t,
+    None => Tag::new(tagged.primary_tag_type()),
+  };
+  apply_values(&mut tag, key, values);
   tag
     .save_to_path(path, WriteOptions::default())
     .map_err(|e| e.to_string())
@@ -153,5 +216,63 @@ mod tests {
       tag.get_strings(ItemKey::Description).collect::<Vec<_>>(),
       vec!["new"],
     );
+  }
+
+  #[test]
+  fn read_values_returns_each_value_in_order() {
+    let mut tag = Tag::new(TagType::Id3v2);
+    for a in ["Daft Punk", "Pharrell Williams"] {
+      tag.push(TagItem::new(
+        ItemKey::TrackArtist,
+        ItemValue::Text(a.to_string()),
+      ));
+    }
+    assert_eq!(
+      read_values(&tag, ItemKey::TrackArtist),
+      vec!["Daft Punk".to_string(), "Pharrell Williams".to_string()],
+    );
+  }
+
+  #[test]
+  fn read_values_is_empty_when_key_absent() {
+    let tag = Tag::new(TagType::Id3v2);
+    assert!(read_values(&tag, ItemKey::Genre).is_empty());
+  }
+
+  #[test]
+  fn apply_values_round_trips_multiple_and_drops_empties() {
+    let mut tag = Tag::new(TagType::Id3v2);
+    apply_values(
+      &mut tag,
+      ItemKey::Genre,
+      &["Electronic".to_string(), String::new(), "House".to_string()],
+    );
+    assert_eq!(
+      read_values(&tag, ItemKey::Genre),
+      vec!["Electronic".to_string(), "House".to_string()],
+    );
+  }
+
+  #[test]
+  fn apply_values_replaces_existing_items() {
+    let mut tag = Tag::new(TagType::Id3v2);
+    apply_values(&mut tag, ItemKey::TrackArtist, &["old".to_string()]);
+    apply_values(
+      &mut tag,
+      ItemKey::TrackArtist,
+      &["a".to_string(), "b".to_string()],
+    );
+    assert_eq!(
+      read_values(&tag, ItemKey::TrackArtist),
+      vec!["a".to_string(), "b".to_string()],
+    );
+  }
+
+  #[test]
+  fn apply_values_with_all_empty_clears_key() {
+    let mut tag = Tag::new(TagType::Id3v2);
+    apply_values(&mut tag, ItemKey::Genre, &["Rock".to_string()]);
+    apply_values(&mut tag, ItemKey::Genre, &[String::new()]);
+    assert!(read_values(&tag, ItemKey::Genre).is_empty());
   }
 }
