@@ -452,6 +452,18 @@ impl TagForm {
   }
 }
 
+/// Identifies which ID3v1 field a "copy to ID3v2" button targets.
+#[derive(Debug, Clone, Copy)]
+enum Id3v1Field {
+  Title,
+  Artist,
+  Album,
+  Year,
+  Track,
+  Genre,
+  Comment,
+}
+
 #[derive(Clone)]
 struct Id3v1Display {
   title: String,
@@ -517,6 +529,11 @@ enum Message {
   HideCoverModal,
   Id3v1Delete,
   Id3v1Deleted(Result<(), String>),
+  /// Copies an ID3v1 field's value into the corresponding (empty) ID3v2 form
+  /// field.
+  Id3v1Copy(Id3v1Field),
+  /// Copies every ID3v1 field whose ID3v2 counterpart is still empty.
+  Id3v1CopyAll,
   CommentOpenUrl(String),
   DescriptionOpenUrl(String),
   ShowAllMetadata,
@@ -746,6 +763,53 @@ impl Taguar {
         self.form.disc.clear();
         self.form.disc_total.clear();
         self.form.compilation = false;
+        Task::none()
+      }
+      Message::Id3v1Copy(field) => {
+        if let Some(v1) = &self.id3v1 {
+          match field {
+            Id3v1Field::Title => self.form.title = v1.title.clone(),
+            Id3v1Field::Artist => self.form.artist = v1.artist.clone(),
+            Id3v1Field::Album => self.form.album = v1.album.clone(),
+            Id3v1Field::Year => self.form.date = v1.year.clone(),
+            Id3v1Field::Track => self.form.track = v1.track.clone(),
+            Id3v1Field::Genre => self.form.genre = v1.genre.clone(),
+            Id3v1Field::Comment => {
+              self.form.comment = v1.comment.clone();
+              self.comment_content =
+                text_editor::Content::with_text(&v1.comment);
+            }
+          }
+        }
+        Task::none()
+      }
+      Message::Id3v1CopyAll => {
+        if let Some(v1) = self.id3v1.clone() {
+          // Only fill empty ID3v2 fields so existing values are never
+          // clobbered, matching the per-field copy buttons.
+          if self.form.artist.trim().is_empty() {
+            self.form.artist = v1.artist;
+          }
+          if self.form.title.trim().is_empty() {
+            self.form.title = v1.title;
+          }
+          if self.form.album.trim().is_empty() {
+            self.form.album = v1.album;
+          }
+          if self.form.date.trim().is_empty() {
+            self.form.date = v1.year;
+          }
+          if self.form.track.trim().is_empty() {
+            self.form.track = v1.track;
+          }
+          if self.form.genre.trim().is_empty() {
+            self.form.genre = v1.genre;
+          }
+          if self.form.comment.trim().is_empty() {
+            self.form.comment = v1.comment.clone();
+            self.comment_content = text_editor::Content::with_text(&v1.comment);
+          }
+        }
         Task::none()
       }
       Message::TitleChanged(v) => {
@@ -2012,27 +2076,103 @@ impl Taguar {
     if let Some(v1) = &self.id3v1 {
       content = content.push(Space::new().height(10));
       content = content.push(text("ID3v1 (read-only)").size(11).color(MUTED));
-      let v1_row = |lbl: &'static str, val: &str| -> Element<Message> {
-        row![
+      let form = &self.form;
+      let v1_row = |lbl: &'static str,
+                    val: &str,
+                    v2_empty: bool,
+                    field: Id3v1Field|
+       -> Element<Message> {
+        let mut r = row![
           text(lbl).size(10).color(MUTED).width(Length::Fixed(56.0)),
           text(val.to_string()).size(10),
         ]
-        .spacing(4)
-        .into()
+        .spacing(4);
+        // Offer to copy into ID3v2 only when v1 has a value and the matching
+        // v2 field is empty (so we never silently overwrite existing data).
+        if !val.is_empty() && v2_empty {
+          r = r.push(Space::new().width(Length::Fixed(12.0)));
+          r = r.push(
+            button(text("Copy →").size(9))
+              .on_press(Message::Id3v1Copy(field))
+              .padding([1, 6])
+              .style(primary_button_style),
+          );
+        }
+        r.into()
       };
-      content = content.push(v1_row("Title", &v1.title));
-      content = content.push(v1_row("Artist", &v1.artist));
-      content = content.push(v1_row("Album", &v1.album));
-      content = content.push(v1_row("Year", &v1.year));
-      content = content.push(v1_row("Track", &v1.track));
-      content = content.push(v1_row("Genre", &v1.genre));
-      content = content.push(v1_row("Comment", &v1.comment));
-      content = content.push(
+      // Every field defined by the ID3v1 standard, in display order. Only the
+      // ones that actually carry a value are rendered below.
+      let v1_fields: [(&'static str, &str, bool, Id3v1Field); 7] = [
+        (
+          "Artist",
+          &v1.artist,
+          form.artist.trim().is_empty(),
+          Id3v1Field::Artist,
+        ),
+        (
+          "Title",
+          &v1.title,
+          form.title.trim().is_empty(),
+          Id3v1Field::Title,
+        ),
+        (
+          "Album",
+          &v1.album,
+          form.album.trim().is_empty(),
+          Id3v1Field::Album,
+        ),
+        (
+          "Year",
+          &v1.year,
+          form.date.trim().is_empty(),
+          Id3v1Field::Year,
+        ),
+        (
+          "Track",
+          &v1.track,
+          form.track.trim().is_empty(),
+          Id3v1Field::Track,
+        ),
+        (
+          "Genre",
+          &v1.genre,
+          form.genre.trim().is_empty(),
+          Id3v1Field::Genre,
+        ),
+        (
+          "Comment",
+          &v1.comment,
+          form.comment.trim().is_empty(),
+          Id3v1Field::Comment,
+        ),
+      ];
+      // Whether any field can still be copied into an empty ID3v2 counterpart;
+      // drives visibility of the "Copy All" shortcut.
+      let any_copyable = v1_fields
+        .iter()
+        .any(|(_, val, v2_empty, _)| !val.is_empty() && *v2_empty);
+      for (lbl, val, v2_empty, field) in v1_fields {
+        if !val.is_empty() {
+          content = content.push(v1_row(lbl, val, v2_empty, field));
+        }
+      }
+      let mut v1_actions = row![].spacing(6);
+      if any_copyable {
+        v1_actions = v1_actions.push(
+          button(text("Copy All →").size(10))
+            .on_press(Message::Id3v1CopyAll)
+            .padding([2, 8])
+            .style(primary_button_style),
+        );
+      }
+      v1_actions = v1_actions.push(
         button(text("Delete ID3v1").size(10))
           .on_press(Message::Id3v1Delete)
           .padding([2, 8])
           .style(button::danger),
       );
+      content = content.push(Space::new().height(4));
+      content = content.push(v1_actions);
     }
 
     if self.selected_idx.is_some() {
