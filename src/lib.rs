@@ -1,8 +1,21 @@
 use lofty::config::WriteOptions;
-use lofty::file::TaggedFileExt;
+use lofty::file::{TaggedFile, TaggedFileExt};
 use lofty::prelude::{ItemKey, TagExt};
 use lofty::tag::{ItemValue, Tag, TagItem, TagType};
 use std::path::Path;
+
+/// Returns the tag edits should go to: the tag matching the file's primary
+/// tag type when present, else the first non-ID3v1 tag. Preferring the
+/// primary type matters for e.g. FLAC files carrying a stray ID3v2 tag:
+/// lofty cannot write ID3v2 to FLAC, so edits must target Vorbis Comments.
+pub fn editable_tag(tagged: &TaggedFile) -> Option<&Tag> {
+  tagged.primary_tag().or_else(|| {
+    tagged
+      .tags()
+      .iter()
+      .find(|t| t.tag_type() != TagType::Id3v1)
+  })
+}
 
 /// Returns every `Description` value present on the tag, in source order,
 /// or a single empty string when none exist so the UI always shows one
@@ -63,12 +76,11 @@ pub fn apply_values(tag: &mut Tag, key: ItemKey, values: &[String]) {
 /// (or the primary tag).
 pub fn read_descriptions_from_path(path: &Path) -> Result<Vec<String>, String> {
   let tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
-  let tag = tagged
-    .tags()
-    .iter()
-    .find(|t| t.tag_type() != TagType::Id3v1)
-    .or_else(|| tagged.primary_tag());
-  Ok(tag.map(read_descriptions).unwrap_or_default())
+  Ok(
+    editable_tag(&tagged)
+      .map(read_descriptions)
+      .unwrap_or_default(),
+  )
 }
 
 /// Writes `descriptions` to the file's primary tag (excluding ID3v1),
@@ -78,12 +90,7 @@ pub fn write_descriptions_to_path(
   descriptions: &[String],
 ) -> Result<(), String> {
   let tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
-  let mut tag = match tagged
-    .tags()
-    .iter()
-    .find(|t| t.tag_type() != TagType::Id3v1)
-    .cloned()
-  {
+  let mut tag = match editable_tag(&tagged).cloned() {
     Some(t) => t,
     None => Tag::new(tagged.primary_tag_type()),
   };
@@ -101,12 +108,11 @@ pub fn read_values_from_path(
   key: ItemKey,
 ) -> Result<Vec<String>, String> {
   let tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
-  let tag = tagged
-    .tags()
-    .iter()
-    .find(|t| t.tag_type() != TagType::Id3v1)
-    .or_else(|| tagged.primary_tag());
-  Ok(tag.map(|t| read_values(t, key)).unwrap_or_default())
+  Ok(
+    editable_tag(&tagged)
+      .map(|t| read_values(t, key))
+      .unwrap_or_default(),
+  )
 }
 
 /// Writes `values` for `key` to the file's primary tag (excluding ID3v1),
@@ -118,12 +124,7 @@ pub fn write_values_to_path(
   values: &[String],
 ) -> Result<(), String> {
   let tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
-  let mut tag = match tagged
-    .tags()
-    .iter()
-    .find(|t| t.tag_type() != TagType::Id3v1)
-    .cloned()
-  {
+  let mut tag = match editable_tag(&tagged).cloned() {
     Some(t) => t,
     None => Tag::new(tagged.primary_tag_type()),
   };

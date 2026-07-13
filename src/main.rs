@@ -3366,11 +3366,7 @@ fn load_file_info(path: &Path) -> Result<FileInfo, String> {
 }
 
 fn editable_tag(tagged_file: &lofty::file::TaggedFile) -> Option<&Tag> {
-  tagged_file
-    .tags()
-    .iter()
-    .find(|t| t.tag_type() != TagType::Id3v1)
-    .or_else(|| tagged_file.primary_tag())
+  taguar::editable_tag(tagged_file)
 }
 
 fn load_full(
@@ -3684,12 +3680,7 @@ fn save_tags(
 
   let tagged_file = lofty::read_from_path(path).map_err(|e| e.to_string())?;
 
-  let mut tag = match tagged_file
-    .tags()
-    .iter()
-    .find(|t| t.tag_type() != TagType::Id3v1)
-    .cloned()
-  {
+  let mut tag = match editable_tag(&tagged_file).cloned() {
     Some(t) => t,
     None => Tag::new(tagged_file.primary_tag_type()),
   };
