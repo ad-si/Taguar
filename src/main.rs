@@ -60,24 +60,21 @@ const BOLD: Font = Font {
 };
 
 pub fn main() -> iced::Result {
-  let arg_dir = std::env::args().nth(1).map(|arg| {
-    if arg == "-h" || arg == "--help" {
-      println!("Usage: taguar [DIRECTORY]");
-      std::process::exit(0);
-    }
-    let path = PathBuf::from(&arg);
-    if !path.is_dir() {
-      eprintln!("Not a directory: {}", path.display());
-      std::process::exit(2);
-    }
-    path.canonicalize().unwrap_or(path)
-  });
+  let args: Vec<String> = std::env::args().skip(1).collect();
+  if args.iter().any(|a| a == "-h" || a == "--help") {
+    println!("Usage: taguar [DIRECTORY | FILE...]");
+    std::process::exit(0);
+  }
+  let source = parse_source(&args);
 
   iced::application(
     move || {
       let state = Taguar::default();
-      let task = match arg_dir.clone() {
-        Some(dir) => Task::done(Message::DirectoryChosen(Some(dir))),
+      let task = match source.clone() {
+        Some(Source::Directory(dir)) => {
+          Task::done(Message::DirectoryChosen(Some(dir)))
+        }
+        Some(Source::Files(files)) => Task::done(Message::FilesChosen(files)),
         None => Task::none(),
       };
       (state, task)
@@ -86,8 +83,20 @@ pub fn main() -> iced::Result {
     Taguar::view,
   )
   .subscription(Taguar::subscription)
-  .title(|state: &Taguar| match &state.directory {
-    Some(dir) => format!("Taguar — {}", dir.to_string_lossy()),
+  .title(|state: &Taguar| match &state.source {
+    Some(Source::Directory(dir)) => {
+      format!("Taguar — {}", dir.to_string_lossy())
+    }
+    Some(Source::Files(files)) => match files.as_slice() {
+      [file] => format!(
+        "Taguar — {}",
+        file
+          .file_name()
+          .map(|n| n.to_string_lossy().into_owned())
+          .unwrap_or_else(|| file.to_string_lossy().into_owned())
+      ),
+      _ => format!("Taguar — {} files", files.len()),
+    },
     None => "Taguar".to_string(),
   })
   .theme(Theme::Light)
@@ -96,6 +105,48 @@ pub fn main() -> iced::Result {
   .font(FONT_BOLD_BYTES)
   .default_font(APP_FONT)
   .run()
+}
+
+/// What the current file listing was loaded from: either a directory that is
+/// scanned recursively, or an explicit list of files passed on the command
+/// line.
+#[derive(Clone)]
+enum Source {
+  Directory(PathBuf),
+  Files(Vec<PathBuf>),
+}
+
+/// Interprets the command-line arguments as either a single directory to scan
+/// or an explicit list of files. A lone directory argument keeps the original
+/// recursive-scan behavior; otherwise every argument is collected into a flat
+/// file list, with any directory argument expanded to the audio files it
+/// contains. Exits with an error for paths that don't exist.
+fn parse_source(args: &[String]) -> Option<Source> {
+  if args.is_empty() {
+    return None;
+  }
+  if let [only] = args {
+    let path = PathBuf::from(only);
+    if path.is_dir() {
+      return Some(Source::Directory(path.canonicalize().unwrap_or(path)));
+    }
+  }
+  let mut files = Vec::new();
+  for arg in args {
+    let path = PathBuf::from(arg);
+    if path.is_dir() {
+      let dir = path.canonicalize().unwrap_or(path);
+      files.extend(scan_audio_paths(&dir));
+    }
+    else if path.is_file() {
+      files.push(path.canonicalize().unwrap_or(path));
+    }
+    else {
+      eprintln!("No such file or directory: {}", path.display());
+      std::process::exit(2);
+    }
+  }
+  Some(Source::Files(files))
 }
 
 /// A column that can be shown in the file listing. The variant order is the
@@ -289,7 +340,7 @@ fn settings_path() -> Option<PathBuf> {
 }
 
 struct Taguar {
-  directory: Option<PathBuf>,
+  source: Option<Source>,
   files: Vec<FileInfo>,
   selected_idx: Option<usize>,
   form: TagForm,
@@ -340,7 +391,7 @@ struct Taguar {
 impl Default for Taguar {
   fn default() -> Self {
     Self {
-      directory: None,
+      source: None,
       files: Vec::new(),
       selected_idx: None,
       form: TagForm::default(),
@@ -589,6 +640,7 @@ struct CoverInfo {
 enum Message {
   SelectDirectory,
   DirectoryChosen(Option<PathBuf>),
+  FilesChosen(Vec<PathBuf>),
   Reload,
   FilesLoaded(Vec<FileInfo>),
   FileSelected(usize),
@@ -714,6 +766,28 @@ enum PictureChange {
 }
 
 impl Taguar {
+  /// Clears the current listing and per-file editing state in preparation for
+  /// loading a fresh set of files (directory scan, explicit file list, or
+  /// reload).
+  fn reset_for_load(&mut self) {
+    playback_send(PlaybackCmd::Stop);
+    self.playing_path = None;
+    self.is_paused = false;
+    self.files.clear();
+    self.selected_idx = None;
+    self.nav_warning = false;
+    self.form = TagForm::default();
+    self.saved_form = TagForm::default();
+    self.clear_pill_drafts();
+    self.lyrics_content = text_editor::Content::new();
+    self.comment_content = text_editor::Content::new();
+    self.description_contents = Vec::new();
+    self.id3v1 = None;
+    self.cover = None;
+    self.primary_tag_label.clear();
+    self.loading = true;
+  }
+
   fn update(&mut self, message: Message) -> Task<Message> {
     match message {
       Message::SelectDirectory => Task::perform(
@@ -727,23 +801,8 @@ impl Taguar {
         Message::DirectoryChosen,
       ),
       Message::DirectoryChosen(Some(dir)) => {
-        playback_send(PlaybackCmd::Stop);
-        self.playing_path = None;
-        self.is_paused = false;
-        self.directory = Some(dir.clone());
-        self.files.clear();
-        self.selected_idx = None;
-        self.nav_warning = false;
-        self.form = TagForm::default();
-        self.saved_form = TagForm::default();
-        self.clear_pill_drafts();
-        self.lyrics_content = text_editor::Content::new();
-        self.comment_content = text_editor::Content::new();
-        self.description_contents = Vec::new();
-        self.id3v1 = None;
-        self.cover = None;
-        self.primary_tag_label.clear();
-        self.loading = true;
+        self.reset_for_load();
+        self.source = Some(Source::Directory(dir.clone()));
         self.status = Some("Loading...".to_string());
         Task::perform(
           async move {
@@ -755,36 +814,37 @@ impl Taguar {
         )
       }
       Message::DirectoryChosen(None) => Task::none(),
+      Message::FilesChosen(paths) => {
+        if paths.is_empty() {
+          return Task::none();
+        }
+        self.reset_for_load();
+        self.source = Some(Source::Files(paths.clone()));
+        self.status = Some("Loading...".to_string());
+        Task::perform(
+          async move {
+            tokio::task::spawn_blocking(move || load_files(&paths))
+              .await
+              .unwrap_or_default()
+          },
+          Message::FilesLoaded,
+        )
+      }
       Message::Reload => {
-        if let Some(dir) = self.directory.clone() {
-          playback_send(PlaybackCmd::Stop);
-          self.playing_path = None;
-          self.is_paused = false;
-          self.files.clear();
-          self.selected_idx = None;
-          self.nav_warning = false;
-          self.form = TagForm::default();
-          self.saved_form = TagForm::default();
-          self.clear_pill_drafts();
-          self.lyrics_content = text_editor::Content::new();
-          self.description_contents = Vec::new();
-          self.id3v1 = None;
-          self.cover = None;
-          self.primary_tag_label.clear();
-          self.loading = true;
-          self.status = Some("Reloading...".to_string());
-          Task::perform(
-            async move {
-              tokio::task::spawn_blocking(move || scan_and_load(&dir))
-                .await
-                .unwrap_or_default()
-            },
-            Message::FilesLoaded,
-          )
-        }
-        else {
-          Task::none()
-        }
+        let load: Box<dyn FnOnce() -> Vec<FileInfo> + Send> = match self
+          .source
+          .clone()
+        {
+          Some(Source::Directory(dir)) => Box::new(move || scan_and_load(&dir)),
+          Some(Source::Files(paths)) => Box::new(move || load_files(&paths)),
+          None => return Task::none(),
+        };
+        self.reset_for_load();
+        self.status = Some("Reloading...".to_string());
+        Task::perform(
+          async move { tokio::task::spawn_blocking(load).await.unwrap_or_default() },
+          Message::FilesLoaded,
+        )
       }
       Message::FilesLoaded(files) => {
         self.files = files;
@@ -1142,7 +1202,7 @@ impl Taguar {
           self.cover = cover;
           // Refresh the file's row in the table.
           if let Ok(mut info) = load_file_info(&path) {
-            if let Some(root) = &self.directory {
+            if let Some(Source::Directory(root)) = &self.source {
               info.filename = path
                 .strip_prefix(root)
                 .unwrap_or(&path)
@@ -1468,7 +1528,7 @@ impl Taguar {
     // Track the cursor whenever a right-click dropdown could be opened: the
     // metadata modal's copy menu, or the song listing's row menu (shown once
     // a directory is loaded).
-    if self.metadata_dump.is_some() || self.directory.is_some() {
+    if self.metadata_dump.is_some() || self.source.is_some() {
       let cursor_sub =
         event::listen_with(|event, _status, _window| match event {
           Event::Mouse(mouse::Event::CursorMoved { position }) => {
@@ -1669,7 +1729,7 @@ impl Taguar {
   }
 
   fn view(&self) -> Element<'_, Message> {
-    if self.directory.is_none() {
+    if self.source.is_none() {
       return container(
         button(text("Select Directory").size(16))
           .on_press(Message::SelectDirectory)
@@ -3220,6 +3280,18 @@ fn scan_and_load(dir: &Path) -> Vec<FileInfo> {
         .into_owned();
       info
     })
+    .collect()
+}
+
+/// Loads [`FileInfo`] for an explicit list of files (as passed on the command
+/// line), preserving the given order. Missing paths are skipped so a reload
+/// after a file was moved or deleted doesn't fail; the row's `filename` is the
+/// bare file name.
+fn load_files(paths: &[PathBuf]) -> Vec<FileInfo> {
+  paths
+    .iter()
+    .filter(|p| p.is_file())
+    .map(|p| load_file_info(p).unwrap_or_else(|_| fallback_info(p)))
     .collect()
 }
 

@@ -10,6 +10,10 @@ ID3v2 / primary metadata tags. Built with [Iced](https://iced.rs/) and
 ## Features
 
 - Select a directory via file dialog or pass one on the command line
+  (`taguar ~/Music`); alternatively pass one or more files directly
+  (`taguar songA.mp3 songB.mp3`), or mix directories and files
+  (`taguar ~/Music songA.mp3`) — directory arguments are expanded to the
+  audio files they contain
 - Recursive scan for audio files (`mp3`, `flac`, `m4a`, `m4b`, `mp4`, `ogg`,
   `opus`, `oga`, `wav`, `aiff`, `aif`, `aifc`, `wv`, `ape`)
 - Left-pane table: **Filename** (relative path), **Artist**, **Title**,
