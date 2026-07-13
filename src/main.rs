@@ -3678,7 +3678,8 @@ fn save_tags(
   // round-trip check in `verify_saved`, which receives this same `form`).
   let form = &form.trimmed();
 
-  let tagged_file = lofty::read_from_path(path).map_err(|e| e.to_string())?;
+  let tagged_file =
+    lofty::read_from_path(path).map_err(|e| format!("read file: {e}"))?;
 
   let mut tag = match editable_tag(&tagged_file).cloned() {
     Some(t) => t,
@@ -3785,12 +3786,12 @@ fn save_tags(
     set_id3v2_descriptions(&mut id3v2, &form.descriptions);
     id3v2
       .save_to_path(path, WriteOptions::default())
-      .map_err(|e| e.to_string())?;
+      .map_err(|e| format!("write tags: {e}"))?;
   }
   else {
     tag
       .save_to_path(path, WriteOptions::default())
-      .map_err(|e| e.to_string())?;
+      .map_err(|e| format!("write tags: {e}"))?;
     if tag_type == TagType::VorbisComments {
       write_vorbis_extras(path, file_type, &date_added, &audio_source)?;
     }
@@ -3829,7 +3830,8 @@ fn verify_saved(
   form: &TagForm,
   tag_type: TagType,
 ) -> Result<(), String> {
-  let tagged = lofty::read_from_path(path).map_err(|e| e.to_string())?;
+  let tagged =
+    lofty::read_from_path(path).map_err(|e| format!("verify: {e}"))?;
   let tag = tagged
     .tags()
     .iter()
@@ -4068,7 +4070,7 @@ fn write_vorbis_extras(
   set_vorbis_field(&mut vc, "DATE_ADDED", date_added);
   set_vorbis_field(&mut vc, "AUDIO_SOURCE", audio_source);
   vc.save_to_path(path, WriteOptions::default())
-    .map_err(|e| e.to_string())
+    .map_err(|e| format!("write extras: {e}"))
 }
 
 fn set_vorbis_field(vc: &mut VorbisComments, key: &str, value: &str) {
@@ -4104,8 +4106,8 @@ fn apply_picture_change(
       let image_file =
         File::open(&img_path).map_err(|e| format!("open image: {e}"))?;
       let mut reader = BufReader::new(image_file);
-      let mut new_pic =
-        Picture::from_reader(&mut reader).map_err(|e| e.to_string())?;
+      let mut new_pic = Picture::from_reader(&mut reader)
+        .map_err(|e| format!("read image: {e}"))?;
 
       // Preserve the pic_type of the picture being replaced when possible.
       let desired_type = cover_idx
