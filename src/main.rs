@@ -12,7 +12,9 @@ use lofty::config::{ParseOptions, WriteOptions};
 use lofty::file::{FileType, TaggedFileExt};
 use lofty::flac::FlacFile;
 use lofty::id3::v2::{ExtendedUrlFrame, Frame, Id3v2Tag};
-use lofty::ogg::{OpusFile, SpeexFile, VorbisComments, VorbisFile};
+use lofty::ogg::{
+  OggPictureStorage, OpusFile, SpeexFile, VorbisComments, VorbisFile,
+};
 use lofty::picture::{Picture, PictureType};
 use lofty::prelude::{Accessor, AudioFile, ItemKey, TagExt};
 use lofty::tag::items::Timestamp;
@@ -4040,9 +4042,17 @@ fn read_vorbis_comments(
     FileType::Vorbis => VorbisFile::read_from(&mut reader, options)
       .ok()
       .map(|f| f.vorbis_comments().clone()),
-    FileType::Flac => FlacFile::read_from(&mut reader, options)
-      .ok()
-      .and_then(|f| f.vorbis_comments().cloned()),
+    FileType::Flac => FlacFile::read_from(&mut reader, options).ok().map(|f| {
+      // FLAC keeps its cover in native PICTURE metadata blocks, separate from
+      // the Vorbis comment block that `vorbis_comments()` returns. Saving a
+      // bare VorbisComments back to the file strips those PICTURE blocks, so
+      // fold them into the returned tag to preserve the cover on write.
+      let mut vc = f.vorbis_comments().cloned().unwrap_or_default();
+      for (pic, info) in f.pictures() {
+        let _ = vc.insert_picture(pic.clone(), Some(*info));
+      }
+      vc
+    }),
     FileType::Speex => SpeexFile::read_from(&mut reader, options)
       .ok()
       .map(|f| f.vorbis_comments().clone()),
