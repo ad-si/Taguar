@@ -1037,11 +1037,24 @@ impl Taguar {
         Task::none()
       }
       Message::DateChanged(v) => {
+        // Recording-date edit: diverging from the release date splits the
+        // unified TDRC/TDRL pair; matching values re-merge into one.
+        if self.form.release_date.is_none() {
+          self.form.release_date = Some(self.form.date.clone());
+        }
         self.form.date = v;
+        if self.form.release_date.as_deref() == Some(self.form.date.as_str()) {
+          self.form.release_date = None;
+        }
         Task::none()
       }
       Message::ReleaseDateChanged(v) => {
-        self.form.release_date = Some(v);
+        match &self.form.release_date {
+          // Unified: edit the shared value so TDRC stays mirrored on save.
+          None => self.form.date = v,
+          Some(_) if v == self.form.date => self.form.release_date = None,
+          Some(_) => self.form.release_date = Some(v),
+        }
         Task::none()
       }
       Message::DateAddedChanged(v) => {
@@ -2023,22 +2036,33 @@ impl Taguar {
       .into()
     };
 
-    let date_label = if form.release_date.is_some() {
-      "Recording Date (TDRC):"
-    }
-    else {
-      "Release Date:"
-    };
-    let date_field = column![
-      label(date_label),
-      text_input("YYYY[-MM[-DD]]", &form.date)
-        .id(iced::widget::Id::new("field-date"))
-        .on_input(Message::DateChanged)
-        .size(12)
-        .padding(4)
-        .width(Length::Fixed(110.0)),
+    // Release Date is the master value: while TDRC and TDRL are unified
+    // (release_date == None) it edits `form.date`, so both fields track it.
+    // Editing Recording Date splits the pair; equal values re-merge them.
+    let release_val = form.release_date.as_deref().unwrap_or(&form.date);
+    let date_field = row![
+      column![
+        label("Release Date:"),
+        text_input("YYYY[-MM[-DD]]", release_val)
+          .id(iced::widget::Id::new("field-date"))
+          .on_input(Message::ReleaseDateChanged)
+          .size(12)
+          .padding(4)
+          .width(Length::Fixed(110.0)),
+      ]
+      .spacing(2),
+      column![
+        label("Recording Date:"),
+        text_input("YYYY[-MM[-DD]]", &form.date)
+          .id(iced::widget::Id::new("field-recording-date"))
+          .on_input(Message::DateChanged)
+          .size(12)
+          .padding(4)
+          .width(Length::Fixed(110.0)),
+      ]
+      .spacing(2),
     ]
-    .spacing(2);
+    .spacing(12);
 
     let album_track_disc = row![
       column![
@@ -2238,13 +2262,6 @@ impl Taguar {
       })
       .push(date_field)
       .push(self.pill_input_view("Genre:", PillField::Genre));
-    if let Some(rd) = &form.release_date {
-      content = content.push(field(
-        "Release Date (TDRL):",
-        rd,
-        Message::ReleaseDateChanged,
-      ));
-    }
     let supports_extras =
       matches!(self.primary_tag_label.as_str(), "ID3v2" | "Vorbis Comments");
     if supports_extras {
