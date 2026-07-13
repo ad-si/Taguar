@@ -852,7 +852,12 @@ impl Taguar {
         self.files = files;
         self.loading = false;
         self.status = None;
-        Task::none()
+        if self.selected_idx.is_none() && !self.files.is_empty() {
+          self.update(Message::FileSelected(0))
+        }
+        else {
+          Task::none()
+        }
       }
       Message::FileSelected(idx) => {
         if self.selected_idx != Some(idx) && self.is_dirty() {
