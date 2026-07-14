@@ -577,12 +577,29 @@ impl PillField {
 /// into multiple entries.
 const PILL_SEPARATORS: [char; 3] = [',', ';', '/'];
 
-/// Splits `text` into individual values on [`PILL_SEPARATORS`], trimming each
-/// and dropping blanks. Only invoked when the user explicitly converts a
-/// single value into multiple — values are never split automatically on read.
+/// Splits `text` into individual values on the single most common
+/// [`PILL_SEPARATORS`] separator, trimming each and dropping blanks. Splitting
+/// on only one separator keeps compound names intact, e.g. `AC/DC,John,Marc`
+/// splits on the two commas into `AC/DC`, `John`, `Marc` rather than also
+/// breaking `AC/DC` apart. Ties are broken by [`PILL_SEPARATORS`] order. Only
+/// invoked when the user explicitly converts a single value into multiple —
+/// values are never split automatically on read.
 fn split_into_values(text: &str) -> Vec<String> {
+  // Pick the separator with the most occurrences, breaking ties toward the
+  // earlier `PILL_SEPARATORS` entry. Falls back to the first separator when
+  // none are present, which leaves `text` as a single value.
+  // `max_by_key` yields the last maximum, so iterate in reverse to make the
+  // earlier `PILL_SEPARATORS` entry win a tie.
+  let separator = PILL_SEPARATORS
+    .iter()
+    .rev()
+    .copied()
+    .max_by_key(|&sep| text.matches(sep).count())
+    .filter(|&sep| text.contains(sep))
+    .unwrap_or(PILL_SEPARATORS[0]);
+
   text
-    .split(PILL_SEPARATORS.as_slice())
+    .split(separator)
     .map(|s| s.trim().to_string())
     .filter(|s| !s.is_empty())
     .collect()
@@ -4504,7 +4521,40 @@ impl rodio::Source for OpusSource {
 
 #[cfg(test)]
 mod tests {
+  use super::split_into_values;
   use super::title_from_filename;
+
+  #[test]
+  fn splits_only_on_the_most_common_separator() {
+    assert_eq!(
+      split_into_values("AC/DC,John,Marc"),
+      vec!["AC/DC", "John", "Marc"],
+    );
+  }
+
+  #[test]
+  fn splits_on_single_present_separator() {
+    assert_eq!(split_into_values("Rock/Pop"), vec!["Rock", "Pop"]);
+    assert_eq!(split_into_values("a; b ;c"), vec!["a", "b", "c"]);
+  }
+
+  #[test]
+  fn keeps_value_intact_without_separators() {
+    assert_eq!(split_into_values("Solo"), vec!["Solo"]);
+  }
+
+  #[test]
+  fn dominant_comma_keeps_slashed_name_together() {
+    assert_eq!(
+      split_into_values("AC/DC,Bob Marley & The Wailers,Slash"),
+      vec!["AC/DC", "Bob Marley & The Wailers", "Slash"],
+    );
+  }
+
+  #[test]
+  fn tie_prefers_earlier_separator() {
+    assert_eq!(split_into_values("a,b/c"), vec!["a", "b/c"]);
+  }
 
   #[test]
   fn title_cases_separators_and_drops_extension() {
