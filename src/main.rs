@@ -134,14 +134,22 @@ fn parse_source(args: &[String]) -> Option<Source> {
     }
   }
   let mut files = Vec::new();
+  let mut seen = std::collections::HashSet::new();
   for arg in args {
     let path = PathBuf::from(arg);
     if path.is_dir() {
       let dir = path.canonicalize().unwrap_or(path);
-      files.extend(scan_audio_paths(&dir));
+      for file in scan_audio_paths(&dir) {
+        if seen.insert(file.clone()) {
+          files.push(file);
+        }
+      }
     }
     else if path.is_file() {
-      files.push(path.canonicalize().unwrap_or(path));
+      let file = path.canonicalize().unwrap_or(path);
+      if seen.insert(file.clone()) {
+        files.push(file);
+      }
     }
     else {
       eprintln!("No such file or directory: {}", path.display());
