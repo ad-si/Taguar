@@ -239,6 +239,7 @@ impl TableColumn {
       Self::Artist => Some(&info.artist),
       Self::Genre => Some(&info.genre),
       Self::Composer => Some(&info.composer),
+      Self::Arranger => Some(&info.arranger),
       _ => None,
     }
   }
@@ -252,7 +253,7 @@ impl TableColumn {
       Self::Genre => info.genre.join(", "),
       Self::ReleaseDate => info.release_date.clone(),
       Self::Composer => info.composer.join(", "),
-      Self::Arranger => info.arranger.clone(),
+      Self::Arranger => info.arranger.join(", "),
       Self::Comment => info.comment.clone(),
       Self::Description => info.description.clone(),
       Self::Duration => format_duration(info.duration_secs),
@@ -377,11 +378,12 @@ struct Taguar {
   /// Transient feedback shown in the modal header after a copy.
   copy_feedback: Option<String>,
   /// In-progress text for each pill field (Artist, Album Artist, Genre,
-  /// Composer) — the value typed but not yet committed to a pill.
+  /// Composer, Arranger) — the value typed but not yet committed to a pill.
   artist_draft: String,
   album_artist_draft: String,
   genre_draft: String,
   composer_draft: String,
+  arranger_draft: String,
   /// Set when a draft edit just emptied a pill input, so the deferred
   /// backspace handler doesn't mistake "deleted the last character" for
   /// "backspace on an already-empty input" and remove a pill.
@@ -425,6 +427,7 @@ impl Default for Taguar {
       album_artist_draft: String::new(),
       genre_draft: String::new(),
       composer_draft: String::new(),
+      arranger_draft: String::new(),
       pill_backspace_suppressed: false,
       nav_warning: false,
       cover_modal_open: false,
@@ -477,7 +480,7 @@ struct FileInfo {
   comment: String,
   description: String,
   composer: Vec<String>,
-  arranger: String,
+  arranger: Vec<String>,
   duration_secs: u64,
   size_bytes: u64,
 }
@@ -504,7 +507,7 @@ struct TagForm {
   descriptions: Vec<String>,
   comment: String,
   composer: Vec<String>,
-  arranger: String,
+  arranger: Vec<String>,
   lyrics: String,
   compilation: bool,
 }
@@ -536,7 +539,7 @@ impl TagForm {
         .collect(),
       comment: self.comment.trim().to_string(),
       composer: trim_values(&self.composer),
-      arranger: self.arranger.trim().to_string(),
+      arranger: trim_values(&self.arranger),
       lyrics: self.lyrics.trim_end().to_string(),
       compilation: self.compilation,
     }
@@ -566,6 +569,7 @@ enum PillField {
   AlbumArtist,
   Genre,
   Composer,
+  Arranger,
 }
 
 impl PillField {
@@ -577,6 +581,7 @@ impl PillField {
       PillField::AlbumArtist => "field-album-artist",
       PillField::Genre => "field-genre",
       PillField::Composer => "field-composer",
+      PillField::Arranger => "field-arranger",
     }
   }
 }
@@ -625,6 +630,7 @@ fn pill_field_for_id(id: &iced::widget::Id) -> Option<PillField> {
     PillField::AlbumArtist,
     PillField::Genre,
     PillField::Composer,
+    PillField::Arranger,
   ]
   .into_iter()
   .find(|f| *id == iced::widget::Id::new(f.input_id()))
@@ -683,7 +689,6 @@ enum Message {
   AudioSourceOpenUrl(String),
   CommentAction(text_editor::Action),
   DescriptionAction(usize, text_editor::Action),
-  ArrangerChanged(String),
   /// Edited a multi-valued field that's currently stored as a single value
   /// (or empty) — kept as a plain string, not split into pills.
   SingleFieldChanged(PillField, String),
@@ -1177,10 +1182,6 @@ impl Taguar {
         }
         Task::none()
       }
-      Message::ArrangerChanged(v) => {
-        self.form.arranger = v;
-        Task::none()
-      }
       Message::LyricsAction(action) => {
         let is_edit = action.is_edit();
         self.lyrics_content.perform(action);
@@ -1596,6 +1597,7 @@ impl Taguar {
       PillField::AlbumArtist => &self.form.album_artist,
       PillField::Genre => &self.form.genre,
       PillField::Composer => &self.form.composer,
+      PillField::Arranger => &self.form.arranger,
     }
   }
 
@@ -1605,6 +1607,7 @@ impl Taguar {
       PillField::AlbumArtist => &mut self.form.album_artist,
       PillField::Genre => &mut self.form.genre,
       PillField::Composer => &mut self.form.composer,
+      PillField::Arranger => &mut self.form.arranger,
     }
   }
 
@@ -1614,6 +1617,7 @@ impl Taguar {
       PillField::AlbumArtist => &self.album_artist_draft,
       PillField::Genre => &self.genre_draft,
       PillField::Composer => &self.composer_draft,
+      PillField::Arranger => &self.arranger_draft,
     }
   }
 
@@ -1623,6 +1627,7 @@ impl Taguar {
       PillField::AlbumArtist => &mut self.album_artist_draft,
       PillField::Genre => &mut self.genre_draft,
       PillField::Composer => &mut self.composer_draft,
+      PillField::Arranger => &mut self.arranger_draft,
     }
   }
 
@@ -1669,6 +1674,7 @@ impl Taguar {
       PillField::AlbumArtist,
       PillField::Genre,
       PillField::Composer,
+      PillField::Arranger,
     ] {
       self.commit_pill_draft(field);
     }
@@ -1679,6 +1685,7 @@ impl Taguar {
     self.album_artist_draft.clear();
     self.genre_draft.clear();
     self.composer_draft.clear();
+    self.arranger_draft.clear();
     self.pill_backspace_suppressed = false;
   }
 
@@ -1688,6 +1695,7 @@ impl Taguar {
       &self.album_artist_draft,
       &self.genre_draft,
       &self.composer_draft,
+      &self.arranger_draft,
     ]
     .iter()
     .any(|d| !d.trim().is_empty())
@@ -2391,7 +2399,7 @@ impl Taguar {
     content = content
       .push(comment_field)
       .push(self.pill_input_view("Composer:", PillField::Composer))
-      .push(field("Arranger:", &form.arranger, Message::ArrangerChanged))
+      .push(self.pill_input_view("Arranger:", PillField::Arranger))
       .push(lyrics_field)
       .push(Space::new().height(14))
       .push(album_fieldset)
@@ -3385,10 +3393,7 @@ fn load_file_info(path: &Path) -> Result<FileInfo, String> {
     info.comment = t.comment().map(|s| s.to_string()).unwrap_or_default();
     info.genre = read_values(t, ItemKey::Genre);
     info.composer = read_values(t, ItemKey::Composer);
-    info.arranger = t
-      .get_string(ItemKey::Arranger)
-      .map(|s| s.to_string())
-      .unwrap_or_default();
+    info.arranger = read_values(t, ItemKey::Arranger);
     // Prefer the explicit release date (TDRL); fall back to the recording
     // date (TDRC) so single-date files still populate the column.
     info.release_date = t
@@ -3470,10 +3475,7 @@ fn load_full(
     form.comment = tag.comment().map(|s| s.to_string()).unwrap_or_default();
     form.descriptions = read_descriptions(tag);
     form.composer = read_values(tag, ItemKey::Composer);
-    form.arranger = tag
-      .get_string(ItemKey::Arranger)
-      .map(|s| s.to_string())
-      .unwrap_or_default();
+    form.arranger = read_values(tag, ItemKey::Arranger);
     form.lyrics = tag
       .get_string(ItemKey::Lyrics)
       .or_else(|| tag.get_string(ItemKey::UnsyncLyrics))
@@ -3747,15 +3749,13 @@ fn save_tags(
   apply_values(&mut tag, ItemKey::Genre, &form.genre);
   apply_values(&mut tag, ItemKey::AlbumArtist, &form.album_artist);
   apply_values(&mut tag, ItemKey::Composer, &form.composer);
+  // Arranger relies on `apply_values`' `push_unchecked` so values reach
+  // lofty's per-format conversion (e.g. ID3v2's TIPL routing); a post-save
+  // round-trip check then surfaces any value the target format can't
+  // represent.
+  apply_values(&mut tag, ItemKey::Arranger, &form.arranger);
 
   apply_descriptions(&mut tag, &form.descriptions);
-
-  // `Tag::insert_text` only accepts keys mapped in the main per-format map,
-  // silently dropping otherwise. We use `insert_unchecked` so values reach
-  // lofty's per-format conversion (e.g. ID3v2's TIPL routing for Arranger);
-  // a post-save round-trip check then surfaces any value the target format
-  // can't represent.
-  put_or_remove(&mut tag, ItemKey::Arranger, &form.arranger);
 
   let lyrics = form.lyrics.clone();
   tag.remove_key(ItemKey::Lyrics);
@@ -3900,7 +3900,7 @@ fn verify_saved(
   if values_missing(&form.composer, &read_values(tag, ItemKey::Composer)) {
     missing.push("Composer");
   }
-  if value_missing(&form.arranger, tag.get_string(ItemKey::Arranger)) {
+  if values_missing(&form.arranger, &read_values(tag, ItemKey::Arranger)) {
     missing.push("Arranger");
   }
   if value_missing(&form.comment, tag.comment().as_deref()) {
@@ -4220,13 +4220,6 @@ fn set_or_remove_dates(
 /// Writes `value` to the tag under `key`, bypassing lofty's per-format map
 /// check so values reach format-specific conversion (e.g. ID3v2 TIPL). Empty
 /// values remove the key.
-fn put_or_remove(tag: &mut Tag, key: ItemKey, value: &str) {
-  tag.remove_key(key);
-  if !value.is_empty() {
-    tag.insert_unchecked(TagItem::new(key, ItemValue::Text(value.to_string())));
-  }
-}
-
 fn parse_opt_date(
   value: &str,
   label: &str,

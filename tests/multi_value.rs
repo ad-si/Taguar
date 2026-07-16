@@ -76,6 +76,30 @@ fn empty_values_are_dropped_on_save() {
 }
 
 #[test]
+fn mp3_round_trips_multiple_arrangers() {
+  // Arranger stores through ID3v2's TIPL (Involved People List) frame rather
+  // than a plain text frame, so verify the multi-value round-trip on that path.
+  let path = copy_fixture("silence.mp3");
+  let arrangers = vec!["Nile Rodgers".to_string(), "Todd Edwards".to_string()];
+  write_values_to_path(&path, ItemKey::Arranger, &arrangers).unwrap();
+  assert_eq!(
+    read_values_from_path(&path, ItemKey::Arranger).unwrap(),
+    arrangers,
+  );
+}
+
+#[test]
+fn flac_round_trips_multiple_arrangers() {
+  let path = copy_fixture("silence.flac");
+  let arrangers = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+  write_values_to_path(&path, ItemKey::Arranger, &arrangers).unwrap();
+  assert_eq!(
+    read_values_from_path(&path, ItemKey::Arranger).unwrap(),
+    arrangers,
+  );
+}
+
+#[test]
 fn flac_round_trips_multiple_artists() {
   let path = copy_fixture("silence.flac");
   let artists = vec!["A".to_string(), "B".to_string(), "C".to_string()];
