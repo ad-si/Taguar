@@ -2311,20 +2311,18 @@ impl Taguar {
         let suggestion = (form.title.is_empty())
           .then(|| selected_file.and_then(|f| title_from_filename(&f.filename)))
           .flatten();
-        let input_row: Element<Message> = if suggestion.is_some() {
-          row![
-            input,
+        // Always wrap the input in a row so appending the "From Filepath"
+        // button doesn't shift the input's position in the widget tree. iced
+        // reconciles widget state by tree position; moving the input would
+        // rebuild it with fresh state and drop keyboard focus mid-typing.
+        let mut input_row = row![input].spacing(4).align_y(Alignment::Center);
+        if suggestion.is_some() {
+          input_row = input_row.push(
             button(text("From Filepath").size(11))
               .on_press(Message::TitleFromFilename)
               .padding([4, 8]),
-          ]
-          .spacing(4)
-          .align_y(Alignment::Center)
-          .into()
+          );
         }
-        else {
-          input.into()
-        };
         column![label("Title:"), input_row].spacing(2)
       })
       .push(date_field)
