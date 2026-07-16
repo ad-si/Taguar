@@ -1741,20 +1741,18 @@ impl Taguar {
       .on_input(move |v| Message::SingleFieldChanged(field, v))
       .size(12)
       .padding(4);
-    let body: Element<Message> = if has_pill_separator(value) {
-      row![
-        input,
+    // Always wrap the input in a row so appending the "Split" button doesn't
+    // shift the input's position in the widget tree. iced reconciles widget
+    // state by tree position; moving the input would rebuild it with fresh
+    // state and drop keyboard focus mid-typing.
+    let mut body = row![input].spacing(4).align_y(Alignment::Center);
+    if has_pill_separator(value) {
+      body = body.push(
         button(text("Split").size(11))
           .on_press(Message::PillSplit(field))
           .padding([4, 8]),
-      ]
-      .spacing(4)
-      .align_y(Alignment::Center)
-      .into()
+      );
     }
-    else {
-      input.into()
-    };
     column![label, body].spacing(2).into()
   }
 
