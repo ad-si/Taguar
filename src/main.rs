@@ -777,6 +777,14 @@ enum Message {
     select: bool,
     id: iced::widget::Id,
   },
+  /// Emacs-style forward delete (Ctrl+D) in the focused editor. iced's
+  /// text_editor rejects Ctrl+D (its Delete binding requires no accompanying
+  /// text, but Ctrl+D carries U+0004), so the multi-line fields need this;
+  /// single-line text_input already forward-deletes on Ctrl+D natively.
+  DeleteForward,
+  ApplyForwardDelete {
+    id: iced::widget::Id,
+  },
   /// Clears all Album-section fields (album, album artist, track, disc,
   /// compilation flag) so the user can blank them in one click.
   AlbumClear,
@@ -991,6 +999,31 @@ impl Taguar {
         else {
           iced::widget::operation::move_cursor_to_front(id)
         }
+      }
+      Message::DeleteForward => iced::advanced::widget::operate(
+        iced::advanced::widget::operation::focusable::find_focused(),
+      )
+      .map(|id| Message::ApplyForwardDelete { id }),
+      Message::ApplyForwardDelete { id } => {
+        use iced::widget::text_editor::{Action, Edit};
+        let action = Action::Edit(Edit::Delete);
+        if id == iced::widget::Id::new("editor-lyrics") {
+          self.lyrics_content.perform(action);
+          return Task::none();
+        }
+        if id == iced::widget::Id::new("editor-comment") {
+          self.comment_content.perform(action);
+          return Task::none();
+        }
+        for (i, c) in self.description_contents.iter_mut().enumerate() {
+          if id == iced::widget::Id::from(format!("editor-description-{i}")) {
+            c.perform(action);
+            return Task::none();
+          }
+        }
+        // Single-line text_input already handles Ctrl+D natively, so any
+        // non-editor focus is a no-op here.
+        Task::none()
       }
       Message::AlbumClear => {
         self.form.album.clear();
@@ -1563,6 +1596,9 @@ impl Taguar {
             }
             keyboard::Key::Character(c) if c.eq_ignore_ascii_case("e") => {
               Some(Message::CursorLineEnd { select })
+            }
+            keyboard::Key::Character(c) if c.eq_ignore_ascii_case("d") => {
+              Some(Message::DeleteForward)
             }
             _ => None,
           }
