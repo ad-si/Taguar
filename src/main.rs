@@ -1,12 +1,16 @@
 #![windows_subsystem = "windows"]
 
+use iced::advanced::layout::{self, Layout};
+use iced::advanced::widget::{tree, Operation, Tree};
+use iced::advanced::{overlay, renderer, Clipboard, Shell, Widget};
 use iced::widget::{
   button, checkbox, column, container, image, mouse_area, opaque, row,
   scrollable, slider, stack, text, text_editor, text_input, Column, Row, Space,
 };
 use iced::{
   event, keyboard, mouse, Alignment, Background, Border, Color, Element, Event,
-  Font, Length, Padding, Point, Subscription, Task, Theme,
+  Font, Length, Padding, Point, Rectangle, Size, Subscription, Task, Theme,
+  Vector,
 };
 use lofty::config::{ParseOptions, WriteOptions};
 use lofty::file::{FileType, TaggedFileExt};
@@ -2386,17 +2390,20 @@ impl Taguar {
     content = content.push(
       row![
         text(format_duration(pos_secs as u64)).size(11).color(MUTED),
-        slider(
-          // Avoid a degenerate range when no file is selected or the
-          // duration is unknown.
-          0.0..=total_secs.max(1) as f64,
-          pos_secs,
-          Message::SeekChanged,
-        )
-        .step(1.0)
-        .on_release(Message::SeekReleased)
-        .height(14.0)
-        .style(seek_slider_style),
+        NormalCursor(
+          slider(
+            // Avoid a degenerate range when no file is selected or the
+            // duration is unknown.
+            0.0..=total_secs.max(1) as f64,
+            pos_secs,
+            Message::SeekChanged,
+          )
+          .step(1.0)
+          .on_release(Message::SeekReleased)
+          .height(14.0)
+          .style(seek_slider_style)
+          .into(),
+        ),
         text(format_duration(total_secs)).size(11).color(MUTED),
       ]
       .spacing(8)
@@ -3273,6 +3280,125 @@ fn primary_button_style(
       radius: 4.0.into(),
     },
     ..button::Style::default()
+  }
+}
+
+/// Wraps a widget and suppresses its mouse cursor, keeping the normal arrow
+/// pointer. Iced's slider hardcodes grab/pointer cursors with no styling hook,
+/// so the seek bar needs this to opt out.
+struct NormalCursor<'a>(Element<'a, Message>);
+
+impl Widget<Message, Theme, iced::Renderer> for NormalCursor<'_> {
+  fn size(&self) -> Size<Length> {
+    self.0.as_widget().size()
+  }
+
+  fn size_hint(&self) -> Size<Length> {
+    self.0.as_widget().size_hint()
+  }
+
+  fn tag(&self) -> tree::Tag {
+    self.0.as_widget().tag()
+  }
+
+  fn state(&self) -> tree::State {
+    self.0.as_widget().state()
+  }
+
+  fn children(&self) -> Vec<Tree> {
+    self.0.as_widget().children()
+  }
+
+  fn diff(&self, tree: &mut Tree) {
+    self.0.as_widget().diff(tree);
+  }
+
+  fn layout(
+    &mut self,
+    tree: &mut Tree,
+    renderer: &iced::Renderer,
+    limits: &layout::Limits,
+  ) -> layout::Node {
+    self.0.as_widget_mut().layout(tree, renderer, limits)
+  }
+
+  fn operate(
+    &mut self,
+    tree: &mut Tree,
+    layout: Layout<'_>,
+    renderer: &iced::Renderer,
+    operation: &mut dyn Operation,
+  ) {
+    self
+      .0
+      .as_widget_mut()
+      .operate(tree, layout, renderer, operation);
+  }
+
+  fn update(
+    &mut self,
+    tree: &mut Tree,
+    event: &Event,
+    layout: Layout<'_>,
+    cursor: mouse::Cursor,
+    renderer: &iced::Renderer,
+    clipboard: &mut dyn Clipboard,
+    shell: &mut Shell<'_, Message>,
+    viewport: &Rectangle,
+  ) {
+    self.0.as_widget_mut().update(
+      tree, event, layout, cursor, renderer, clipboard, shell, viewport,
+    );
+  }
+
+  fn draw(
+    &self,
+    tree: &Tree,
+    renderer: &mut iced::Renderer,
+    theme: &Theme,
+    style: &renderer::Style,
+    layout: Layout<'_>,
+    cursor: mouse::Cursor,
+    viewport: &Rectangle,
+  ) {
+    self
+      .0
+      .as_widget()
+      .draw(tree, renderer, theme, style, layout, cursor, viewport);
+  }
+
+  fn mouse_interaction(
+    &self,
+    _tree: &Tree,
+    _layout: Layout<'_>,
+    _cursor: mouse::Cursor,
+    _viewport: &Rectangle,
+    _renderer: &iced::Renderer,
+  ) -> mouse::Interaction {
+    mouse::Interaction::None
+  }
+
+  fn overlay<'a>(
+    &'a mut self,
+    tree: &'a mut Tree,
+    layout: Layout<'a>,
+    renderer: &iced::Renderer,
+    viewport: &Rectangle,
+    translation: Vector,
+  ) -> Option<overlay::Element<'a, Message, Theme, iced::Renderer>> {
+    self.0.as_widget_mut().overlay(
+      tree,
+      layout,
+      renderer,
+      viewport,
+      translation,
+    )
+  }
+}
+
+impl<'a> From<NormalCursor<'a>> for Element<'a, Message> {
+  fn from(widget: NormalCursor<'a>) -> Self {
+    Element::new(widget)
   }
 }
 
