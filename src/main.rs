@@ -2,7 +2,7 @@
 
 use iced::widget::{
   button, checkbox, column, container, image, mouse_area, opaque, row,
-  scrollable, stack, text, text_editor, text_input, Column, Row, Space,
+  scrollable, slider, stack, text, text_editor, text_input, Column, Row, Space,
 };
 use iced::{
   event, keyboard, mouse, Alignment, Background, Border, Color, Element, Event,
@@ -24,8 +24,10 @@ use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, OnceLock};
 use std::thread;
+use std::time::Duration;
 use taguar::{
   apply_descriptions, apply_values, read_descriptions, read_values,
 };
@@ -366,6 +368,11 @@ struct Taguar {
   loading: bool,
   playing_path: Option<PathBuf>,
   is_paused: bool,
+  /// Playback position of the active track in seconds, polled while playing.
+  playback_pos_secs: f64,
+  /// Seek-bar value while the user is dragging it; the actual seek is only
+  /// sent to the playback thread on release.
+  seek_drag_secs: Option<f64>,
   metadata_dump: Option<MetadataDump>,
   /// Open right-click dropdown within the metadata modal.
   copy_menu: Option<CopyMenu>,
@@ -418,6 +425,8 @@ impl Default for Taguar {
       loading: false,
       playing_path: None,
       is_paused: false,
+      playback_pos_secs: 0.0,
+      seek_drag_secs: None,
       metadata_dump: None,
       copy_menu: None,
       song_menu: None,
@@ -710,6 +719,12 @@ enum Message {
   PlayPauseToggle,
   /// Stop playback of the current track and reset to the start.
   PlaybackStop,
+  /// Periodic poll of the playback position while a track is playing.
+  PlaybackTick,
+  /// The seek bar is being dragged — only previews the position.
+  SeekChanged(f64),
+  /// The seek bar was released — jumps playback to the chosen position.
+  SeekReleased,
   Save,
   Saved(Result<(), String>),
   /// Discard any unsaved edits in the form, reverting to the last saved
@@ -1245,9 +1260,15 @@ impl Taguar {
             }
           }
           else {
+            // Clear any leftover state from a previous track before the
+            // worker starts publishing the new one's position.
+            PLAYBACK_FINISHED.store(false, Ordering::Relaxed);
+            PLAYBACK_POS_MS.store(0, Ordering::Relaxed);
             playback_send(PlaybackCmd::Play(path.clone()));
             self.playing_path = Some(path);
             self.is_paused = false;
+            self.playback_pos_secs = 0.0;
+            self.seek_drag_secs = None;
           }
         }
         Task::none()
@@ -1256,6 +1277,36 @@ impl Taguar {
         playback_send(PlaybackCmd::Stop);
         self.playing_path = None;
         self.is_paused = false;
+        self.playback_pos_secs = 0.0;
+        self.seek_drag_secs = None;
+        Task::none()
+      }
+      Message::PlaybackTick => {
+        if PLAYBACK_FINISHED.swap(false, Ordering::Relaxed) {
+          self.playing_path = None;
+          self.is_paused = false;
+          self.playback_pos_secs = 0.0;
+          self.seek_drag_secs = None;
+        }
+        else if self.seek_drag_secs.is_none() {
+          self.playback_pos_secs =
+            PLAYBACK_POS_MS.load(Ordering::Relaxed) as f64 / 1000.0;
+        }
+        Task::none()
+      }
+      Message::SeekChanged(secs) => {
+        // The bar is a no-op placeholder while the selected file isn't the
+        // active track.
+        if self.selected_is_active() {
+          self.seek_drag_secs = Some(secs);
+        }
+        Task::none()
+      }
+      Message::SeekReleased => {
+        if let Some(secs) = self.seek_drag_secs.take() {
+          self.playback_pos_secs = secs;
+          playback_send(PlaybackCmd::Seek(Duration::from_secs_f64(secs)));
+        }
         Task::none()
       }
       Message::Save => self.spawn_save(PictureChange::None, "Saving..."),
@@ -1541,7 +1592,8 @@ impl Taguar {
   }
 
   /// Only subscribes to cursor events when the metadata modal is open — so
-  /// the rest of the app isn't paying for per-pixel messages.
+  /// the rest of the app isn't paying for per-pixel messages. Likewise the
+  /// playback-position tick only runs while a track is actually playing.
   fn subscription(&self) -> Subscription<Message> {
     let keyboard_sub = event::listen_with(|event, status, _window| {
       let captured = matches!(status, event::Status::Captured);
@@ -1607,21 +1659,39 @@ impl Taguar {
       }
     });
 
+    let mut subs = vec![keyboard_sub];
+
     // Track the cursor whenever a right-click dropdown could be opened: the
     // metadata modal's copy menu, or the song listing's row menu (shown once
     // a directory is loaded).
     if self.metadata_dump.is_some() || self.source.is_some() {
-      let cursor_sub =
-        event::listen_with(|event, _status, _window| match event {
-          Event::Mouse(mouse::Event::CursorMoved { position }) => {
-            Some(Message::CursorMoved(position))
-          }
-          _ => None,
-        });
-      Subscription::batch([keyboard_sub, cursor_sub])
+      subs.push(event::listen_with(|event, _status, _window| match event {
+        Event::Mouse(mouse::Event::CursorMoved { position }) => {
+          Some(Message::CursorMoved(position))
+        }
+        _ => None,
+      }));
     }
-    else {
-      keyboard_sub
+
+    // Keep the seek bar moving while a track plays.
+    if self.playing_path.is_some() && !self.is_paused {
+      subs.push(
+        iced::time::every(Duration::from_millis(250))
+          .map(|_| Message::PlaybackTick),
+      );
+    }
+
+    Subscription::batch(subs)
+  }
+
+  /// Whether the selected file is the active (playing or paused) track.
+  fn selected_is_active(&self) -> bool {
+    match (
+      &self.playing_path,
+      self.selected_idx.and_then(|i| self.files.get(i)),
+    ) {
+      (Some(playing), Some(selected)) => *playing == selected.path,
+      _ => false,
     }
   }
 
@@ -2290,17 +2360,50 @@ impl Taguar {
       })
       .unwrap_or_default();
 
-    let mut content = Column::new()
-      .spacing(6)
-      .push(
-        row![
-          playback_controls,
-          text(file_info_text).size(11).color(MUTED),
-        ]
-        .spacing(12)
-        .align_y(Alignment::Center)
-        .padding([0, 0]),
-      )
+    let mut content = Column::new().spacing(6).push(
+      row![
+        playback_controls,
+        text(file_info_text).size(11).color(MUTED),
+      ]
+      .spacing(12)
+      .align_y(Alignment::Center)
+      .padding([0, 0]),
+    );
+
+    // Seek bar — always present so starting playback doesn't shift the
+    // layout below. It stays at 0:00 and ignores drags until the selected
+    // file is the active track.
+    let total_secs = selected_file.map(|f| f.duration_secs).unwrap_or(0);
+    let pos_secs = if is_active {
+      self
+        .seek_drag_secs
+        .unwrap_or(self.playback_pos_secs)
+        .min(total_secs as f64)
+    }
+    else {
+      0.0
+    };
+    content = content.push(
+      row![
+        text(format_duration(pos_secs as u64)).size(11).color(MUTED),
+        slider(
+          // Avoid a degenerate range when no file is selected or the
+          // duration is unknown.
+          0.0..=total_secs.max(1) as f64,
+          pos_secs,
+          Message::SeekChanged,
+        )
+        .step(1.0)
+        .on_release(Message::SeekReleased)
+        .height(14.0)
+        .style(seek_slider_style),
+        text(format_duration(total_secs)).size(11).color(MUTED),
+      ]
+      .spacing(8)
+      .align_y(Alignment::Center),
+    );
+
+    content = content
       .push(self.pill_input_view("Artist:", PillField::Artist))
       .push({
         let input = text_input("", &form.title)
@@ -3170,6 +3273,30 @@ fn primary_button_style(
       radius: 4.0.into(),
     },
     ..button::Style::default()
+  }
+}
+
+fn seek_slider_style(_theme: &Theme, status: slider::Status) -> slider::Style {
+  let handle_color = match status {
+    slider::Status::Hovered | slider::Status::Dragged => ORANGE_DARK,
+    _ => ORANGE,
+  };
+  slider::Style {
+    rail: slider::Rail {
+      backgrounds: (Background::Color(ORANGE), Background::Color(BORDER)),
+      width: 4.0,
+      border: Border {
+        color: Color::TRANSPARENT,
+        width: 0.0,
+        radius: 2.0.into(),
+      },
+    },
+    handle: slider::Handle {
+      shape: slider::HandleShape::Circle { radius: 6.0 },
+      background: Background::Color(handle_color),
+      border_width: 0.0,
+      border_color: Color::TRANSPARENT,
+    },
   }
 }
 
@@ -4298,9 +4425,17 @@ enum PlaybackCmd {
   Pause,
   Resume,
   Stop,
+  Seek(Duration),
 }
 
 static PLAYBACK: OnceLock<mpsc::Sender<PlaybackCmd>> = OnceLock::new();
+
+/// Current playback position in milliseconds, published by the worker and
+/// polled by the UI's tick subscription.
+static PLAYBACK_POS_MS: AtomicU64 = AtomicU64::new(0);
+/// Set by the worker when the active track played to its end, so the UI can
+/// reset the transport controls. Consumed (swapped to false) by the UI.
+static PLAYBACK_FINISHED: AtomicBool = AtomicBool::new(false);
 
 const PLAYBACK_THREAD_NAME: &str = "taguar-playback";
 
@@ -4337,9 +4472,16 @@ fn playback_worker(rx: mpsc::Receiver<PlaybackCmd>) {
   let mixer = device_sink.mixer();
   let mut player: Option<rodio::Player> = None;
 
-  while let Ok(cmd) = rx.recv() {
+  loop {
+    // Wake up regularly (even without commands) to publish the position.
+    let cmd = match rx.recv_timeout(Duration::from_millis(200)) {
+      Ok(cmd) => Some(cmd),
+      Err(mpsc::RecvTimeoutError::Timeout) => None,
+      Err(mpsc::RecvTimeoutError::Disconnected) => break,
+    };
     match cmd {
-      PlaybackCmd::Play(path) => {
+      None => {}
+      Some(PlaybackCmd::Play(path)) => {
         if let Some(p) = player.take() {
           p.stop();
         }
@@ -4362,10 +4504,13 @@ fn playback_worker(rx: mpsc::Receiver<PlaybackCmd>) {
         else {
           match File::open(&path) {
             Ok(file) => {
-              let reader = BufReader::new(file);
+              // `try_from` (unlike `Decoder::new`) marks the source as
+              // seekable and sets its byte length — without this, symphonia
+              // can only "seek" forward by skipping ahead, and seeking
+              // backwards fails.
               let decoder_result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                  rodio::Decoder::new(reader)
+                  rodio::Decoder::try_from(file)
                 }));
               match decoder_result {
                 Ok(Ok(decoder)) => {
@@ -4391,21 +4536,39 @@ fn playback_worker(rx: mpsc::Receiver<PlaybackCmd>) {
           Err(e) => eprintln!("play error: {e}"),
         }
       }
-      PlaybackCmd::Pause => {
+      Some(PlaybackCmd::Pause) => {
         if let Some(p) = &player {
           p.pause();
         }
       }
-      PlaybackCmd::Resume => {
+      Some(PlaybackCmd::Resume) => {
         if let Some(p) = &player {
           p.play();
         }
       }
-      PlaybackCmd::Stop => {
+      Some(PlaybackCmd::Stop) => {
         if let Some(p) = player.take() {
           p.stop();
         }
+        PLAYBACK_POS_MS.store(0, Ordering::Relaxed);
       }
+      Some(PlaybackCmd::Seek(pos)) => {
+        if let Some(p) = &player {
+          if let Err(e) = p.try_seek(pos) {
+            eprintln!("seek error: {e}");
+          }
+        }
+      }
+    }
+
+    // Publish the position (or completion) for the UI's tick handler.
+    if player.as_ref().is_some_and(|p| p.empty()) {
+      player = None;
+      PLAYBACK_POS_MS.store(0, Ordering::Relaxed);
+      PLAYBACK_FINISHED.store(true, Ordering::Relaxed);
+    }
+    else if let Some(p) = &player {
+      PLAYBACK_POS_MS.store(p.get_pos().as_millis() as u64, Ordering::Relaxed);
     }
   }
 }
@@ -4418,6 +4581,8 @@ struct OpusSource {
   reader: ogg::PacketReader<BufReader<File>>,
   decoder: opus::Decoder,
   channels: rodio::ChannelCount,
+  /// Pre-skip from the OpusHead — granule positions include these samples.
+  pre_skip: u64,
   pre_skip_remaining: u64,
   samples: Vec<f32>,
   sample_pos: usize,
@@ -4460,6 +4625,7 @@ impl OpusSource {
       reader,
       decoder,
       channels: ch_num,
+      pre_skip,
       pre_skip_remaining: pre_skip,
       samples: Vec::new(),
       sample_pos: 0,
@@ -4549,6 +4715,33 @@ impl rodio::Source for OpusSource {
   }
   fn total_duration(&self) -> Option<std::time::Duration> {
     None
+  }
+
+  fn try_seek(
+    &mut self,
+    pos: Duration,
+  ) -> Result<(), rodio::source::SeekError> {
+    use rodio::source::SeekError;
+
+    // Ogg granule positions for Opus count 48 kHz samples from the start of
+    // the stream, including the pre-skip samples.
+    let absgp = (pos.as_secs_f64() * 48_000.0) as u64 + self.pre_skip;
+    let found = self
+      .reader
+      .seek_absgp(None, absgp)
+      .map_err(|e| SeekError::Other(std::sync::Arc::new(e)))?;
+    if !found {
+      return Err(SeekError::NotSupported {
+        underlying_source: "ogg-opus",
+      });
+    }
+    let _ = self.decoder.reset_state();
+    self.samples.clear();
+    self.sample_pos = 0;
+    // The seek already skipped past the start of the stream.
+    self.pre_skip_remaining = 0;
+    self.finished = false;
+    Ok(())
   }
 }
 
