@@ -5,17 +5,28 @@ use iced::advanced::widget::{tree, Operation, Tree};
 use iced::advanced::{overlay, renderer, Clipboard, Shell, Widget};
 use iced::widget::{
   button, checkbox, column, container, image, mouse_area, opaque, row,
-  scrollable, slider, stack, text, text_editor, text_input, Column, Row, Space,
+  scrollable, slider, stack, text, text_editor, text_input, tooltip, Column,
+  Row, Space,
 };
 use iced::{
   event, keyboard, mouse, Alignment, Background, Border, Color, Element, Event,
   Font, Length, Padding, Point, Rectangle, Size, Subscription, Task, Theme,
   Vector,
 };
+use lofty::aac::AacFile;
+use lofty::ape::{ApeFile, ApeTag};
 use lofty::config::{ParseOptions, WriteOptions};
 use lofty::file::{FileType, TaggedFileExt};
 use lofty::flac::FlacFile;
-use lofty::id3::v2::{ExtendedUrlFrame, Frame, Id3v2Tag};
+use lofty::id3::v1::{Id3v1Tag, GENRES};
+use lofty::id3::v2::{
+  ExtendedUrlFrame, Frame, FrameFlags, Id3v2Tag, Id3v2Version,
+};
+use lofty::iff::aiff::{AiffFile, AiffTextChunks};
+use lofty::iff::wav::{RiffInfoList, WavFile};
+use lofty::mp4::{AtomData, AtomIdent, DataType, Ilst, Mp4File};
+use lofty::mpeg::{ChannelMode, Layer, MpegFile, MpegVersion};
+use lofty::musepack::MpcFile;
 use lofty::ogg::{
   OggPictureStorage, OpusFile, SpeexFile, VorbisComments, VorbisFile,
 };
@@ -23,6 +34,7 @@ use lofty::picture::{Picture, PictureType};
 use lofty::prelude::{Accessor, AudioFile, ItemKey, TagExt};
 use lofty::tag::items::Timestamp;
 use lofty::tag::{ItemValue, Tag, TagItem, TagType};
+use lofty::wavpack::WavPackFile;
 use lofty::TextEncoding;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
@@ -467,7 +479,7 @@ struct SongMenu {
 }
 
 /// Snapshot of the currently selected file's metadata, shown in the
-/// "All Metadata" modal as a heading plus (key, value) rows per section.
+/// "All Metadata" modal as a heading plus rows per section.
 #[derive(Clone)]
 struct MetadataDump {
   sections: Vec<MetadataSection>,
@@ -476,7 +488,36 @@ struct MetadataDump {
 #[derive(Clone)]
 struct MetadataSection {
   heading: String,
-  rows: Vec<(String, String)>,
+  rows: Vec<MetadataRow>,
+}
+
+#[derive(Clone)]
+struct MetadataRow {
+  /// Human-readable name of the field, e.g. "Artist".
+  label: String,
+  /// The identifier as actually stored in the file, e.g. "©ART". Revealed on
+  /// hover and used when copying.
+  key: String,
+  value: String,
+}
+
+impl MetadataRow {
+  /// A row whose key is already plain English (file info, audio properties,
+  /// tag headers), so there's nothing to reveal on hover.
+  fn plain(key: impl Into<String>, value: impl Into<String>) -> Self {
+    let key = key.into();
+    Self {
+      label: key.clone(),
+      key,
+      value: value.into(),
+    }
+  }
+
+  /// A tag item, labelled from its raw identifier where a name is known.
+  fn tagged(tag_type: TagType, key: String, value: String) -> Self {
+    let label = friendly_label(tag_type, &key).unwrap_or_else(|| key.clone());
+    Self { label, key, value }
+  }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2870,8 +2911,8 @@ impl Taguar {
       if section.rows.is_empty() {
         section_col = section_col.push(text("(empty)").size(11).color(MUTED));
       }
-      for (key, value) in &section.rows {
-        section_col = section_col.push(self.metadata_row_view(key, value));
+      for row in &section.rows {
+        section_col = section_col.push(self.metadata_row_view(row));
       }
 
       body = body.push(section_col);
@@ -2919,24 +2960,42 @@ impl Taguar {
 
   fn metadata_row_view<'a>(
     &self,
-    key: &'a str,
-    value: &'a str,
+    metadata_row: &'a MetadataRow,
   ) -> Element<'a, Message> {
-    let label = text(key.to_string())
+    let label_text = text(metadata_row.label.clone())
       .size(11)
       .color(MUTED)
       .font(BOLD)
       .width(Length::Fixed(180.0));
 
+    // Where the label is a friendlier name than what's in the file, hovering
+    // reveals the raw identifier (`Artist` → `©ART`).
+    let label: Element<Message> = if metadata_row.label == metadata_row.key {
+      label_text.into()
+    }
+    else {
+      tooltip(
+        label_text,
+        container(text(metadata_row.key.clone()).size(11))
+          .padding([2, 6])
+          .style(tooltip_style),
+        tooltip::Position::Right,
+      )
+      .into()
+    };
+
     // Let the value widget fill the remaining width so long values wrap
     // inside the panel instead of pushing the row past the scrollable's
     // reserved scrollbar area.
-    let value_area =
-      mouse_area(text(value.to_string()).size(11).width(Length::Fill))
-        .on_right_press(Message::OpenCopyMenu {
-          key: key.to_string(),
-          value: value.to_string(),
-        });
+    let value_area = mouse_area(
+      text(metadata_row.value.clone())
+        .size(11)
+        .width(Length::Fill),
+    )
+    .on_right_press(Message::OpenCopyMenu {
+      key: metadata_row.key.clone(),
+      value: metadata_row.value.clone(),
+    });
 
     row![label, value_area]
       .width(Length::Fill)
@@ -3226,6 +3285,18 @@ fn modal_panel_style(_theme: &Theme) -> container::Style {
       color: BORDER,
       width: 1.0,
       radius: 6.0.into(),
+    },
+    ..container::Style::default()
+  }
+}
+
+fn tooltip_style(_theme: &Theme) -> container::Style {
+  container::Style {
+    background: Some(Background::Color(HEADER_BG)),
+    border: Border {
+      color: BORDER,
+      width: 1.0,
+      radius: 3.0.into(),
     },
     ..container::Style::default()
   }
@@ -3825,7 +3896,7 @@ fn load_metadata_dump(path: &Path) -> MetadataDump {
 
   sections.push(MetadataSection {
     heading: "File".to_string(),
-    rows: vec![("Path".to_string(), path.display().to_string())],
+    rows: vec![MetadataRow::plain("Path", path.display().to_string())],
   });
 
   let tagged_file = match lofty::read_from_path(path) {
@@ -3833,11 +3904,15 @@ fn load_metadata_dump(path: &Path) -> MetadataDump {
     Err(e) => {
       sections.push(MetadataSection {
         heading: "Error".to_string(),
-        rows: vec![("Message".to_string(), e.to_string())],
+        rows: vec![MetadataRow::plain("Message", e.to_string())],
       });
       return MetadataDump { sections };
     }
   };
+
+  // Everything lofty's generic API doesn't expose: format-specific audio
+  // properties and the tags in their native form.
+  let native = load_native_metadata(path, tagged_file.file_type());
 
   // Audio properties
   let p = tagged_file.properties();
@@ -3865,21 +3940,38 @@ fn load_metadata_dump(path: &Path) -> MetadataDump {
   if let Some(ch) = p.channels() {
     props.push(("Channels".to_string(), ch.to_string()));
   }
+  props.extend(native.properties);
   if let Ok(meta) = std::fs::metadata(path) {
     props.push(("File Size".to_string(), format_size(meta.len())));
   }
   sections.push(MetadataSection {
     heading: "Audio Properties".to_string(),
-    rows: props,
+    rows: props
+      .into_iter()
+      .map(|(key, value)| MetadataRow::plain(key, value))
+      .collect(),
   });
 
-  // One section per tag on the file (ID3v2, ID3v1, Vorbis, MP4 ilst, …).
+  // One section per tag on the file (ID3v2, ID3v1, Vorbis, MP4 ilst, …),
+  // read in their native form so nothing is hidden. See
+  // `load_native_metadata` for why the generic tags aren't enough.
+  if native.sections.is_empty() {
+    sections.extend(generic_tag_sections(&tagged_file));
+  }
+  else {
+    sections.extend(native.sections);
+  }
+
+  MetadataDump { sections }
+}
+
+/// Fallback tag sections built from lofty's generic [`Tag`]s, used for file
+/// types [`load_native_tag_sections`] doesn't handle.
+fn generic_tag_sections(
+  tagged_file: &lofty::file::TaggedFile,
+) -> Vec<MetadataSection> {
+  let mut sections = Vec::new();
   for tag in tagged_file.tags() {
-    let heading = format!(
-      "{} ({} items)",
-      tag_type_label(tag.tag_type()),
-      tag.item_count()
-    );
     let mut rows: Vec<(String, String)> = tag
       .items()
       .map(|item| {
@@ -3892,33 +3984,874 @@ fn load_metadata_dump(path: &Path) -> MetadataDump {
         (key, value)
       })
       .collect();
-    for (i, pic) in tag.pictures().iter().enumerate() {
-      let mime = pic
-        .mime_type()
-        .map(|m| m.as_str().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-      let (w, h) = probe_image_dims(pic.data());
-      let dims = if w > 0 && h > 0 {
-        format!("{w}x{h}, ")
-      }
-      else {
-        String::new()
+    push_picture_rows(&mut rows, tag.pictures().iter());
+    sections.push(tag_section(tag.tag_type(), rows));
+  }
+  sections
+}
+
+/// Metadata of `path` that lofty's generic API doesn't expose.
+#[derive(Default)]
+struct NativeMetadata {
+  /// Format-specific audio properties, appended to the generic ones.
+  properties: Vec<(String, String)>,
+  /// One section per tag, read in the tag's native form.
+  sections: Vec<MetadataSection>,
+}
+
+fn prop_row(key: &str, value: impl Into<String>) -> (String, String) {
+  (key.to_string(), value.into())
+}
+
+/// Reads `path` through its format-specific file type, which keeps both the
+/// codec details and the tag items that the generic API loses.
+///
+/// [`lofty::read_from_path`] hands back generic [`Tag`]s and a generic
+/// [`FileProperties`](lofty::properties::FileProperties). The tag conversion
+/// silently drops every item lofty has no [`ItemKey`] mapping for — the MP4
+/// `apID` (iTunes account) atom, `cnID`, `purd`, unknown ID3v2 frames, custom
+/// Vorbis comments, … They stay behind in the discarded `SplitTagRemainder`.
+/// The properties conversion likewise keeps only what every format has in
+/// common, dropping e.g. the MP3 layer or the FLAC MD5 signature. The "All
+/// Metadata" modal is supposed to show *everything*, so it reads the file
+/// again natively.
+///
+/// [`NativeMetadata::sections`] is empty for file types with no native reader
+/// here (and for files without any tag), which makes the caller fall back to
+/// the generic tags.
+fn load_native_metadata(path: &Path, file_type: FileType) -> NativeMetadata {
+  let Ok(file) = File::open(path) else {
+    return NativeMetadata::default();
+  };
+  let mut reader = BufReader::new(file);
+  let opts = ParseOptions::new();
+  let mut props = Vec::new();
+  let mut sections = Vec::new();
+
+  match file_type {
+    FileType::Mpeg => {
+      let Ok(f) = MpegFile::read_from(&mut reader, opts) else {
+        return NativeMetadata::default();
       };
-      rows.push((
-        format!("Picture #{}", i + 1),
-        format!(
-          "{} — {}{} KB, {}",
-          pic_type_label(pic.pic_type()),
-          dims,
-          pic.data().len() / 1024,
-          mime
-        ),
+      let p = f.properties();
+      props.push(prop_row("MPEG Version", mpeg_version_label(p.version())));
+      props.push(prop_row(
+        "Layer",
+        match p.layer() {
+          Layer::Layer1 => "Layer I",
+          Layer::Layer2 => "Layer II",
+          Layer::Layer3 => "Layer III",
+        },
       ));
+      props.push(prop_row(
+        "Channel Mode",
+        match p.channel_mode() {
+          ChannelMode::Stereo => "Stereo",
+          ChannelMode::JointStereo => "Joint Stereo",
+          ChannelMode::DualChannel => "Dual Channel",
+          ChannelMode::SingleChannel => "Mono",
+        },
+      ));
+      if let Some(ext) = p.mode_extension() {
+        props.push(prop_row("Mode Extension", ext.to_string()));
+      }
+      if let Some(emphasis) = p.emphasis() {
+        props.push(prop_row("Emphasis", format!("{emphasis:?}")));
+      }
+      props.push(prop_row("Copyrighted", p.is_copyright().to_string()));
+      props.push(prop_row("Original", p.is_original().to_string()));
+      if let Some(t) = f.id3v2() {
+        sections.push(id3v2_section(t));
+      }
+      if let Some(t) = f.id3v1() {
+        sections.push(tag_section(TagType::Id3v1, id3v1_rows(t)));
+      }
+      if let Some(t) = f.ape() {
+        sections.push(tag_section(TagType::Ape, ape_rows(t)));
+      }
     }
-    sections.push(MetadataSection { heading, rows });
+    FileType::Aac => {
+      let Ok(f) = AacFile::read_from(&mut reader, opts) else {
+        return NativeMetadata::default();
+      };
+      let p = f.properties();
+      props.push(prop_row("MPEG Version", mpeg_version_label(&p.version())));
+      props.push(prop_row(
+        "Audio Object Type",
+        format!("{:?}", p.audio_object_type()),
+      ));
+      push_channel_mask(&mut props, p.channel_mask());
+      props.push(prop_row("Copyrighted", p.copyright().to_string()));
+      props.push(prop_row("Original", p.original().to_string()));
+      if let Some(t) = f.id3v2() {
+        sections.push(id3v2_section(t));
+      }
+      if let Some(t) = f.id3v1() {
+        sections.push(tag_section(TagType::Id3v1, id3v1_rows(t)));
+      }
+    }
+    FileType::Mp4 => {
+      let Ok(f) = Mp4File::read_from(&mut reader, opts) else {
+        return NativeMetadata::default();
+      };
+      let p = f.properties();
+      // The brand is a four character code, padded with spaces (`M4A `).
+      props.push(prop_row("Major Brand", f.ftyp().trim_end().to_string()));
+      props.push(prop_row("Codec", format!("{:?}", p.codec())));
+      if let Some(aot) = p.audio_object_type() {
+        props.push(prop_row("Audio Object Type", format!("{aot:?}")));
+      }
+      if p.is_drm_protected() {
+        props.push(prop_row("DRM Protected", "true"));
+      }
+      if let Some(t) = f.ilst() {
+        sections.push(tag_section(TagType::Mp4Ilst, ilst_rows(t)));
+      }
+    }
+    FileType::Flac => {
+      let Ok(f) = FlacFile::read_from(&mut reader, opts) else {
+        return NativeMetadata::default();
+      };
+      // An all-zero signature means the encoder didn't record one.
+      let signature = f.properties().signature();
+      if signature != 0 {
+        props.push(prop_row("MD5 Signature", format!("{signature:032x}")));
+      }
+      if let Some(t) = f.vorbis_comments() {
+        let mut section = vorbis_section(t);
+        // FLAC keeps its pictures in native PICTURE metadata blocks rather
+        // than in the Vorbis comment block.
+        let mut pictures = Vec::new();
+        push_picture_rows(&mut pictures, f.pictures().iter().map(|(p, _)| p));
+        section.rows.extend(
+          pictures
+            .into_iter()
+            .map(|(key, value)| MetadataRow::plain(key, value)),
+        );
+        sections.push(section);
+      }
+      if let Some(t) = f.id3v2() {
+        sections.push(id3v2_section(t));
+      }
+    }
+    FileType::Vorbis => {
+      let Ok(f) = VorbisFile::read_from(&mut reader, opts) else {
+        return NativeMetadata::default();
+      };
+      let p = f.properties();
+      props.push(prop_row("Vorbis Version", p.version().to_string()));
+      for (key, bitrate) in [
+        ("Nominal Bitrate", p.bitrate_nominal()),
+        ("Minimum Bitrate", p.bitrate_min()),
+        ("Maximum Bitrate", p.bitrate_max()),
+      ] {
+        if bitrate > 0 {
+          props.push(prop_row(key, format!("{bitrate} bps")));
+        }
+      }
+      sections.push(vorbis_section(f.vorbis_comments()));
+    }
+    FileType::Opus => {
+      let Ok(f) = OpusFile::read_from(&mut reader, opts) else {
+        return NativeMetadata::default();
+      };
+      let p = f.properties();
+      props.push(prop_row("Opus Version", p.version().to_string()));
+      props.push(prop_row(
+        "Input Sample Rate",
+        format!("{} Hz", p.input_sample_rate()),
+      ));
+      push_channel_mask(&mut props, Some(p.channel_mask()));
+      sections.push(vorbis_section(f.vorbis_comments()));
+    }
+    FileType::Speex => {
+      let Ok(f) = SpeexFile::read_from(&mut reader, opts) else {
+        return NativeMetadata::default();
+      };
+      let p = f.properties();
+      props.push(prop_row("Speex Version", p.version().to_string()));
+      props.push(prop_row("Mode", p.mode().to_string()));
+      props.push(prop_row("VBR", p.vbr().to_string()));
+      if p.nominal_bitrate() > 0 {
+        props.push(prop_row(
+          "Nominal Bitrate",
+          format!("{} bps", p.nominal_bitrate()),
+        ));
+      }
+      sections.push(vorbis_section(f.vorbis_comments()));
+    }
+    FileType::Wav => {
+      let Ok(f) = WavFile::read_from(&mut reader, opts) else {
+        return NativeMetadata::default();
+      };
+      let p = f.properties();
+      props.push(prop_row("Format", format!("{:?}", p.format())));
+      push_channel_mask(&mut props, p.channel_mask());
+      if let Some(t) = f.riff_info() {
+        sections.push(tag_section(TagType::RiffInfo, riff_info_rows(t)));
+      }
+      if let Some(t) = f.id3v2() {
+        sections.push(id3v2_section(t));
+      }
+    }
+    FileType::Aiff => {
+      let Ok(f) = AiffFile::read_from(&mut reader, opts) else {
+        return NativeMetadata::default();
+      };
+      let p = f.properties();
+      if let Some(compression) = p.compression_type() {
+        props.push(prop_row(
+          "Compression",
+          compression.compression_name().into_owned(),
+        ));
+      }
+      if let Some(t) = f.text_chunks() {
+        sections.push(tag_section(TagType::AiffText, aiff_text_rows(t)));
+      }
+      if let Some(t) = f.id3v2() {
+        sections.push(id3v2_section(t));
+      }
+    }
+    FileType::Ape => {
+      let Ok(f) = ApeFile::read_from(&mut reader, opts) else {
+        return NativeMetadata::default();
+      };
+      props.push(prop_row(
+        "APE Version",
+        f.properties().version().to_string(),
+      ));
+      if let Some(t) = f.ape() {
+        sections.push(tag_section(TagType::Ape, ape_rows(t)));
+      }
+      if let Some(t) = f.id3v2() {
+        sections.push(id3v2_section(t));
+      }
+      if let Some(t) = f.id3v1() {
+        sections.push(tag_section(TagType::Id3v1, id3v1_rows(t)));
+      }
+    }
+    FileType::WavPack => {
+      let Ok(f) = WavPackFile::read_from(&mut reader, opts) else {
+        return NativeMetadata::default();
+      };
+      let p = f.properties();
+      props.push(prop_row("WavPack Version", p.version().to_string()));
+      props.push(prop_row("Lossless", p.is_lossless().to_string()));
+      push_channel_mask(&mut props, Some(p.channel_mask()));
+      if let Some(t) = f.ape() {
+        sections.push(tag_section(TagType::Ape, ape_rows(t)));
+      }
+      if let Some(t) = f.id3v1() {
+        sections.push(tag_section(TagType::Id3v1, id3v1_rows(t)));
+      }
+    }
+    FileType::Mpc => {
+      let Ok(f) = MpcFile::read_from(&mut reader, opts) else {
+        return NativeMetadata::default();
+      };
+      props.push(prop_row(
+        "Stream Version",
+        format!("{:?}", f.stream_version()),
+      ));
+      if let Some(t) = f.ape() {
+        sections.push(tag_section(TagType::Ape, ape_rows(t)));
+      }
+      if let Some(t) = f.id3v2() {
+        sections.push(id3v2_section(t));
+      }
+      if let Some(t) = f.id3v1() {
+        sections.push(tag_section(TagType::Id3v1, id3v1_rows(t)));
+      }
+    }
+    _ => {}
   }
 
-  MetadataDump { sections }
+  NativeMetadata {
+    properties: props,
+    sections,
+  }
+}
+
+fn mpeg_version_label(version: &MpegVersion) -> &'static str {
+  match version {
+    MpegVersion::V1 => "MPEG 1",
+    MpegVersion::V2 => "MPEG 2",
+    MpegVersion::V2_5 => "MPEG 2.5",
+    MpegVersion::V4 => "MPEG 4",
+  }
+}
+
+fn push_channel_mask(
+  props: &mut Vec<(String, String)>,
+  mask: Option<lofty::properties::ChannelMask>,
+) {
+  if let Some(mask) = mask {
+    if mask.bits() != 0 {
+      props.push(prop_row("Channel Mask", format!("0x{:08x}", mask.bits())));
+    }
+  }
+}
+
+fn tag_section(
+  tag_type: TagType,
+  rows: Vec<(String, String)>,
+) -> MetadataSection {
+  MetadataSection {
+    heading: format!("{} ({} items)", tag_type_label(tag_type), rows.len()),
+    rows: rows
+      .into_iter()
+      .map(|(key, value)| MetadataRow::tagged(tag_type, key, value))
+      .collect(),
+  }
+}
+
+/// Plain-English name for the raw identifier `key` of a `tag_type` item —
+/// `©ART` becomes "Artist" — or `None` when the identifier is already the
+/// most descriptive name available.
+fn friendly_label(tag_type: TagType, key: &str) -> Option<String> {
+  // Numbered rows (`ANNO #2`) are looked up without their suffix.
+  let (base, number) = match key.rsplit_once(" #") {
+    Some((base, n)) if n.chars().all(|c| c.is_ascii_digit()) => (base, Some(n)),
+    _ => (key, None),
+  };
+
+  let label = label_for_key(tag_type, base)?;
+  Some(match number {
+    Some(n) => format!("{label} #{n}"),
+    None => label,
+  })
+}
+
+fn label_for_key(tag_type: TagType, key: &str) -> Option<String> {
+  // A whole-key match wins: `TXXX:REPLAYGAIN_TRACK_GAIN` is one field, not a
+  // `TXXX` frame that happens to be described as a replay gain.
+  if let Some(label) = known_key_label(key)
+    .map(str::to_string)
+    .or_else(|| ItemKey::from_key(tag_type, key).map(item_key_label))
+  {
+    return Some(label);
+  }
+
+  // Otherwise the identifier is a container (`TXXX`, `PRIV`, `COMM`, an MP4
+  // freeform atom) plus a description naming the actual field.
+  let (prefix, description) = key_parts(key);
+  let prefix_label = known_key_label(prefix)
+    .map(str::to_string)
+    .or_else(|| ItemKey::from_key(tag_type, prefix).map(item_key_label));
+  let Some(description) = description else {
+    return prefix_label;
+  };
+  // User-defined frames and freeform atoms exist purely to carry a name, so
+  // the description alone is the clearest label.
+  if is_user_defined(prefix) {
+    return Some(description.to_string());
+  }
+  prefix_label.map(|prefix_label| format!("{prefix_label}: {description}"))
+}
+
+/// Splits `COMM[eng]:iTunNORM` into its identifier and its description.
+fn key_parts(key: &str) -> (&str, Option<&str>) {
+  let prefix_end = key.find([':', '[']).unwrap_or(key.len());
+  let description = key
+    .rsplit_once(':')
+    .map(|(_, description)| description)
+    .filter(|description| !description.is_empty());
+  (&key[..prefix_end], description)
+}
+
+fn is_user_defined(prefix: &str) -> bool {
+  matches!(prefix, "TXXX" | "WXXX" | "----")
+}
+
+/// Names for identifiers lofty has no [`ItemKey`] for, plus the frames and
+/// atoms whose own name is more useful than the field they map to.
+fn known_key_label(key: &str) -> Option<&'static str> {
+  Some(match key {
+    // iTunes Store bookkeeping, written when a file is bought or matched.
+    "apID" => "iTunes Account",
+    "akID" => "iTunes Account Type",
+    "atID" => "iTunes Artist ID",
+    "cmID" => "iTunes Composer ID",
+    "cnID" => "iTunes Catalog ID",
+    "geID" => "iTunes Genre ID",
+    "plID" => "iTunes Album ID",
+    "sfID" => "iTunes Store Country",
+    "purd" => "Purchase Date",
+    "ownr" => "Owner",
+    // MP4 playback and video flags.
+    "covr" => "Cover Art",
+    "stik" => "Media Type",
+    "pgap" => "Gapless Playback",
+    "shwm" => "Show Movement",
+    "hdvd" => "HD Video",
+    "flvr" => "Flavor",
+    "tven" => "TV Episode ID",
+    "tves" => "TV Episode",
+    "tvnn" => "TV Network",
+    "tvsn" => "TV Season",
+    // ID3v2 frames with no `ItemKey`, or whose frame name says more.
+    "APIC" | "PIC" => "Cover Art",
+    "CHAP" => "Chapter",
+    "CTOC" => "Table of Contents",
+    "COMR" => "Commercial",
+    "ETCO" => "Event Timing Codes",
+    "EQU2" | "EQUA" => "Equalisation",
+    "GEOB" => "Encapsulated Object",
+    "IPLS" | "TIPL" => "Involved People",
+    "MCDI" => "Music CD Identifier",
+    "OWNE" => "Ownership",
+    "PRIV" => "Private Data",
+    "RVA2" | "RVAD" => "Relative Volume Adjustment",
+    "SYLT" => "Synchronised Lyrics",
+    "TDLY" => "Playlist Delay",
+    "TFLT" => "File Type",
+    "TMCL" => "Musician Credits",
+    "UFID" => "Unique File ID",
+    "USER" => "Terms of Use",
+    _ => return None,
+  })
+}
+
+/// Plain-English name for a lofty [`ItemKey`]. Variants that aren't named
+/// here fall back to their own name split into words, which reads well for
+/// the long tail (`AlbumTitleSortOrder` → "Album Title Sort Order").
+fn item_key_label(key: ItemKey) -> String {
+  let label = match key {
+    ItemKey::TrackTitle => "Title",
+    ItemKey::TrackSubtitle => "Subtitle",
+    ItemKey::TrackArtist => "Artist",
+    ItemKey::TrackArtists => "Artists",
+    ItemKey::TrackArtistUrl => "Artist URL",
+    ItemKey::TrackNumber => "Track",
+    ItemKey::TrackTotal => "Track Total",
+    ItemKey::TrackTitleSortOrder => "Title Sort Order",
+    ItemKey::TrackArtistSortOrder => "Artist Sort Order",
+    ItemKey::AlbumTitle => "Album",
+    ItemKey::AlbumTitleSortOrder => "Album Sort Order",
+    ItemKey::DiscNumber => "Disc",
+    ItemKey::DiscTotal => "Disc Total",
+    ItemKey::RecordingDate => "Date",
+    ItemKey::CopyrightMessage => "Copyright",
+    ItemKey::EncoderSoftware => "Encoder",
+    ItemKey::EncoderSettings => "Encoder Settings",
+    ItemKey::FlagCompilation => "Compilation",
+    ItemKey::FlagPodcast => "Podcast",
+    ItemKey::UnsyncLyrics => "Lyrics",
+    ItemKey::Bpm | ItemKey::IntegerBpm => "BPM",
+    ItemKey::Isrc => "ISRC",
+    ItemKey::AcoustId => "AcoustID",
+    ItemKey::AcoustIdFingerprint => "AcoustID Fingerprint",
+    ItemKey::MusicBrainzRecordingId => "MusicBrainz Recording ID",
+    ItemKey::MusicBrainzTrackId => "MusicBrainz Track ID",
+    ItemKey::MusicBrainzReleaseId => "MusicBrainz Release ID",
+    ItemKey::MusicBrainzReleaseGroupId => "MusicBrainz Release Group ID",
+    ItemKey::MusicBrainzArtistId => "MusicBrainz Artist ID",
+    ItemKey::MusicBrainzReleaseArtistId => "MusicBrainz Release Artist ID",
+    ItemKey::MusicBrainzWorkId => "MusicBrainz Work ID",
+    ItemKey::MusicBrainzReleaseType => "MusicBrainz Release Type",
+    ItemKey::ReplayGainAlbumGain => "ReplayGain Album Gain",
+    ItemKey::ReplayGainAlbumPeak => "ReplayGain Album Peak",
+    ItemKey::ReplayGainTrackGain => "ReplayGain Track Gain",
+    ItemKey::ReplayGainTrackPeak => "ReplayGain Track Peak",
+    ItemKey::AudioFileUrl => "Audio File URL",
+    ItemKey::AudioSourceUrl => "Audio Source URL",
+    ItemKey::CommercialInformationUrl => "Commercial Information URL",
+    ItemKey::CopyrightUrl => "Copyright URL",
+    ItemKey::PaymentUrl => "Payment URL",
+    ItemKey::PublisherUrl => "Publisher URL",
+    ItemKey::PodcastUrl => "Podcast URL",
+    ItemKey::RadioStationUrl => "Radio Station URL",
+    ItemKey::PodcastGlobalUniqueId => "Podcast Global Unique ID",
+    ItemKey::AppleXid => "Apple XID",
+    other => return split_camel_case(&format!("{other:?}")),
+  };
+  label.to_string()
+}
+
+/// `AlbumArtistSortOrder` → `Album Artist Sort Order`.
+fn split_camel_case(name: &str) -> String {
+  let mut out = String::with_capacity(name.len() + 4);
+  for (i, c) in name.char_indices() {
+    if i > 0 && c.is_ascii_uppercase() {
+      out.push(' ');
+    }
+    out.push(c);
+  }
+  out
+}
+
+/// Appends a `Picture #N` row per embedded picture.
+fn push_picture_rows<'a>(
+  rows: &mut Vec<(String, String)>,
+  pictures: impl Iterator<Item = &'a Picture>,
+) {
+  for (i, pic) in pictures.enumerate() {
+    rows.push((format!("Picture #{}", i + 1), picture_summary(pic)));
+  }
+}
+
+/// One-line summary of an embedded picture, shared by every tag format.
+fn picture_summary(pic: &Picture) -> String {
+  let mime = pic
+    .mime_type()
+    .map(|m| m.as_str().to_string())
+    .unwrap_or_else(|| "unknown".to_string());
+  let (w, h) = probe_image_dims(pic.data());
+  let dims = if w > 0 && h > 0 {
+    format!("{w}x{h}, ")
+  }
+  else {
+    String::new()
+  };
+  format!(
+    "{} — {}{} KB, {}",
+    pic_type_label(pic.pic_type()),
+    dims,
+    pic.data().len() / 1024,
+    mime
+  )
+}
+
+/// Renders ID3v2.4's `\0` multi-value separator visibly, since a raw NUL is
+/// invisible and would silently glue two values together.
+fn show_multi_value(text: &str) -> String {
+  text.split('\0').collect::<Vec<_>>().join(" / ")
+}
+
+/// The ID3v2 section, with the tag header (version, flags) ahead of the
+/// frames. The heading's item count stays the number of frames.
+fn id3v2_section(tag: &Id3v2Tag) -> MetadataSection {
+  let mut section = tag_section(TagType::Id3v2, id3v2_rows(tag));
+  section.rows.splice(
+    0..0,
+    id3v2_header_rows(tag)
+      .into_iter()
+      .map(|(key, value)| MetadataRow::plain(key, value)),
+  );
+  section
+}
+
+fn id3v2_header_rows(tag: &Id3v2Tag) -> Vec<(String, String)> {
+  let version = match tag.original_version() {
+    Id3v2Version::V2 => "ID3v2.2",
+    Id3v2Version::V3 => "ID3v2.3",
+    Id3v2Version::V4 => "ID3v2.4",
+  };
+  let mut rows = vec![prop_row("Version", version)];
+
+  let flags = tag.flags();
+  let mut set = Vec::new();
+  for (name, is_set) in [
+    ("unsynchronisation", flags.unsynchronisation),
+    ("experimental", flags.experimental),
+    ("footer", flags.footer),
+    ("CRC", flags.crc),
+    ("restrictions", flags.restrictions.is_some()),
+  ] {
+    if is_set {
+      set.push(name);
+    }
+  }
+  if !set.is_empty() {
+    rows.push(prop_row("Flags", set.join(", ")));
+  }
+  rows
+}
+
+fn id3v2_rows(tag: &Id3v2Tag) -> Vec<(String, String)> {
+  tag
+    .into_iter()
+    .map(|frame| {
+      let flags = frame_flags_label(frame.flags());
+      let (key, value) = id3v2_frame_row(frame);
+      (key, format!("{value}{flags}"))
+    })
+    .collect()
+}
+
+/// Suffix listing the frame flags that are set, empty when they're default.
+fn frame_flags_label(flags: FrameFlags) -> String {
+  let mut set = Vec::new();
+  if flags.tag_alter_preservation {
+    set.push("preserve on tag edit".to_string());
+  }
+  if flags.file_alter_preservation {
+    set.push("preserve on file edit".to_string());
+  }
+  if flags.read_only {
+    set.push("read-only".to_string());
+  }
+  if flags.compression {
+    set.push("compressed".to_string());
+  }
+  if flags.unsynchronisation {
+    set.push("unsynchronised".to_string());
+  }
+  if let Some(group) = flags.grouping_identity {
+    set.push(format!("group {group}"));
+  }
+  if let Some(method) = flags.encryption {
+    set.push(format!("encrypted (method {method})"));
+  }
+  if set.is_empty() {
+    String::new()
+  }
+  else {
+    format!("  [{}]", set.join(", "))
+  }
+}
+
+fn id3v2_frame_row(frame: &Frame<'static>) -> (String, String) {
+  let id = frame.id_str().to_string();
+  match frame {
+    Frame::Text(f) => (id, show_multi_value(&f.value)),
+    Frame::UserText(f) => (
+      format!("{id}:{}", f.description),
+      show_multi_value(&f.content),
+    ),
+    Frame::Url(f) => (id, f.url().to_string()),
+    Frame::UserUrl(f) => {
+      (format!("{id}:{}", f.description), f.content.to_string())
+    }
+    Frame::Timestamp(f) => (id, f.timestamp.to_string()),
+    Frame::Comment(f) => (
+      format!("{id}[{}]:{}", lang_label(&f.language), f.description),
+      f.content.to_string(),
+    ),
+    Frame::UnsynchronizedText(f) => (
+      format!("{id}[{}]:{}", lang_label(&f.language), f.description),
+      f.content.to_string(),
+    ),
+    Frame::Picture(f) => (id, picture_summary(&f.picture)),
+    Frame::Popularimeter(f) => (
+      format!("{id}:{}", f.email),
+      format!("rating {}/255, {} plays", f.rating, f.counter),
+    ),
+    Frame::KeyValue(f) => (
+      id,
+      f.key_value_pairs
+        .iter()
+        .map(|(k, v)| format!("{k}: {v}"))
+        .collect::<Vec<_>>()
+        .join("; "),
+    ),
+    Frame::RelativeVolumeAdjustment(f) => (
+      format!("{id}:{}", f.identification),
+      format!("{} channels", f.channels.len()),
+    ),
+    Frame::UniqueFileIdentifier(f) => (
+      format!("{id}:{}", f.owner),
+      String::from_utf8_lossy(&f.identifier).into_owned(),
+    ),
+    Frame::Ownership(f) => (
+      id,
+      format!(
+        "paid {} on {} to {}",
+        f.price_paid, f.date_of_purchase, f.seller
+      ),
+    ),
+    Frame::EventTimingCodes(f) => (id, format!("{} events", f.events.len())),
+    Frame::Private(f) => (
+      format!("{id}:{}", f.owner),
+      format!("[binary] {} bytes", f.private_data.len()),
+    ),
+    Frame::Binary(f) => (id, format!("[binary] {} bytes", f.data.len())),
+    _ => (id, "[unsupported frame]".to_string()),
+  }
+}
+
+fn lang_label(lang: &[u8; 3]) -> String {
+  String::from_utf8_lossy(lang).into_owned()
+}
+
+fn id3v1_rows(tag: &Id3v1Tag) -> Vec<(String, String)> {
+  let mut rows = Vec::new();
+  let mut push = |key: &str, value: Option<String>| {
+    if let Some(value) = value {
+      rows.push((key.to_string(), value));
+    }
+  };
+  push("Title", tag.title.clone());
+  push("Artist", tag.artist.clone());
+  push("Album", tag.album.clone());
+  push("Year", tag.year.map(|y| y.to_string()));
+  push("Comment", tag.comment.clone());
+  push("Track Number", tag.track_number.map(|t| t.to_string()));
+  push(
+    "Genre",
+    tag.genre.map(|g| match GENRES.get(g as usize) {
+      Some(name) => format!("{g} ({name})"),
+      None => g.to_string(),
+    }),
+  );
+  rows
+}
+
+fn ilst_rows(tag: &Ilst) -> Vec<(String, String)> {
+  let mut rows = Vec::new();
+  for atom in tag {
+    let key = atom_ident_label(atom.ident());
+    for data in atom.data() {
+      rows.push((key.clone(), atom_data_display(atom.ident(), data)));
+    }
+  }
+  rows
+}
+
+/// `©nam`-style four character codes, or the `----:mean:name` form for
+/// freeform atoms.
+fn atom_ident_label(ident: &AtomIdent<'_>) -> String {
+  match ident {
+    AtomIdent::Fourcc(fourcc) => {
+      fourcc.iter().map(|b| *b as char).collect::<String>()
+    }
+    AtomIdent::Freeform { mean, name } => format!("----:{mean}:{name}"),
+  }
+}
+
+fn atom_data_display(ident: &AtomIdent<'_>, data: &AtomData) -> String {
+  match data {
+    AtomData::UTF8(s) | AtomData::UTF16(s) => s.clone(),
+    AtomData::Picture(pic) => picture_summary(pic),
+    AtomData::SignedInteger(i) => i.to_string(),
+    AtomData::UnsignedInteger(u) => u.to_string(),
+    AtomData::Bool(b) => b.to_string(),
+    AtomData::Unknown { code, data } => {
+      unknown_atom_display(ident, *code, data)
+    }
+  }
+}
+
+/// Best-effort rendering of atoms lofty leaves as raw bytes, so integer-typed
+/// items (`stik`, `cnID`, `sfID`, …) and the packed `trkn`/`disk` pairs stay
+/// readable instead of showing as a byte count.
+fn unknown_atom_display(
+  ident: &AtomIdent<'_>,
+  code: DataType,
+  data: &[u8],
+) -> String {
+  // `trkn` and `disk` pack the number and the total into one reserved atom:
+  // two padding bytes, the number, the total, then padding.
+  if let AtomIdent::Fourcc(fourcc) = ident {
+    if (fourcc == b"trkn" || fourcc == b"disk") && data.len() >= 6 {
+      let current = u16::from_be_bytes([data[2], data[3]]);
+      let total = u16::from_be_bytes([data[4], data[5]]);
+      return if total > 0 {
+        format!("{current}/{total}")
+      }
+      else {
+        current.to_string()
+      };
+    }
+  }
+
+  let is_int = matches!(
+    code,
+    DataType::BeSignedInteger
+      | DataType::Signed8BitInteger
+      | DataType::Be16BitSignedInteger
+      | DataType::Be32BitSignedInteger
+      | DataType::BeUnsignedInteger
+      // Small reserved payloads are almost always integers as well (flags,
+      // ratings, iTunes IDs).
+      | DataType::Reserved
+  );
+  let is_signed =
+    !matches!(code, DataType::BeUnsignedInteger | DataType::Reserved);
+
+  match code {
+    DataType::Utf8 | DataType::Utf8Sort => {
+      String::from_utf8_lossy(data).into_owned()
+    }
+    _ if is_int && !data.is_empty() && data.len() <= 8 => {
+      be_int(data, is_signed).to_string()
+    }
+    _ => format!("[{code:?}] {} bytes", data.len()),
+  }
+}
+
+/// Decodes a big-endian integer of 1-8 bytes, sign-extending when `signed`.
+fn be_int(data: &[u8], signed: bool) -> i64 {
+  let value = data.iter().fold(0i64, |acc, b| (acc << 8) | i64::from(*b));
+  if signed && data.len() < 8 && data[0] & 0x80 != 0 {
+    value - (1i64 << (8 * data.len()))
+  }
+  else {
+    value
+  }
+}
+
+/// The Vorbis Comments section. The vendor string is a header field rather
+/// than a comment, so it sits above the items and outside the item count.
+fn vorbis_section(tag: &VorbisComments) -> MetadataSection {
+  let mut section = tag_section(TagType::VorbisComments, vorbis_rows(tag));
+  if !tag.vendor().is_empty() {
+    section
+      .rows
+      .insert(0, MetadataRow::plain("Vendor", tag.vendor().to_string()));
+  }
+  section
+}
+
+fn vorbis_rows(tag: &VorbisComments) -> Vec<(String, String)> {
+  let mut rows: Vec<(String, String)> = tag
+    .items()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+  push_picture_rows(&mut rows, tag.pictures().iter().map(|(pic, _)| pic));
+  rows
+}
+
+fn ape_rows(tag: &ApeTag) -> Vec<(String, String)> {
+  tag
+    .into_iter()
+    .map(|item| {
+      let value = match item.value() {
+        ItemValue::Text(t) => t.clone(),
+        ItemValue::Locator(t) => format!("[locator] {t}"),
+        ItemValue::Binary(b) => format!("[binary] {} bytes", b.len()),
+      };
+      let read_only = if item.read_only { "  [read-only]" } else { "" };
+      (item.key().to_string(), format!("{value}{read_only}"))
+    })
+    .collect()
+}
+
+fn riff_info_rows(tag: &RiffInfoList) -> Vec<(String, String)> {
+  tag.into_iter().cloned().collect()
+}
+
+fn aiff_text_rows(tag: &AiffTextChunks) -> Vec<(String, String)> {
+  let mut rows = Vec::new();
+  if let Some(name) = &tag.name {
+    rows.push(("NAME".to_string(), name.clone()));
+  }
+  if let Some(author) = &tag.author {
+    rows.push(("AUTH".to_string(), author.clone()));
+  }
+  if let Some(copyright) = &tag.copyright {
+    rows.push(("(c) ".to_string(), copyright.clone()));
+  }
+  for (i, annotation) in tag.annotations.iter().flatten().enumerate() {
+    rows.push((format!("ANNO #{}", i + 1), annotation.clone()));
+  }
+  for (i, comment) in tag.comments.iter().flatten().enumerate() {
+    let mut value = comment.text.clone();
+    // The timestamp counts seconds since January 1, 1904; a marker id of 0
+    // means the comment isn't linked to a marker.
+    if comment.timestamp > 0 {
+      value.push_str(&format!("  [t={}", comment.timestamp));
+      if comment.marker_id > 0 {
+        value.push_str(&format!(", marker {}", comment.marker_id));
+      }
+      value.push(']');
+    }
+    else if comment.marker_id > 0 {
+      value.push_str(&format!("  [marker {}]", comment.marker_id));
+    }
+    rows.push((format!("COMT #{}", i + 1), value));
+  }
+  rows
 }
 
 fn probe_image_dims(data: &[u8]) -> (u32, u32) {
@@ -4875,6 +5808,217 @@ impl rodio::Source for OpusSource {
 mod tests {
   use super::split_into_values;
   use super::title_from_filename;
+  use super::*;
+  use lofty::mp4::Atom;
+
+  /// Copies a fixture to a uniquely named temp file for destructive tests.
+  fn temp_copy(fixture: &str, name: &str) -> PathBuf {
+    let dest = std::env::temp_dir().join(name);
+    let _ = std::fs::remove_file(&dest);
+    std::fs::copy(Path::new("tests/fixtures").join(fixture), &dest).unwrap();
+    dest
+  }
+
+  fn dump_metadata_rows(path: &Path) -> Vec<MetadataRow> {
+    load_metadata_dump(path)
+      .sections
+      .into_iter()
+      .flat_map(|s| s.rows)
+      .collect()
+  }
+
+  fn dump_rows(path: &Path) -> Vec<(String, String)> {
+    dump_metadata_rows(path)
+      .into_iter()
+      .map(|r| (r.key, r.value))
+      .collect()
+  }
+
+  /// The label shown for the row stored under `key`.
+  fn label_of(rows: &[MetadataRow], key: &str) -> String {
+    rows
+      .iter()
+      .find(|r| r.key == key)
+      .unwrap_or_else(|| panic!("no row for {key}"))
+      .label
+      .clone()
+  }
+
+  /// `apID` and friends have no `ItemKey` mapping in lofty, so they vanish
+  /// from the generic `Tag`. The dump has to read the native `ilst`.
+  #[test]
+  fn dump_shows_mp4_atoms_without_an_item_key() {
+    let path = temp_copy("silence.m4a", "taguar_unmapped_atom.m4a");
+
+    let mut ilst = Ilst::new();
+    ilst.insert(Atom::new(
+      AtomIdent::Fourcc([0xA9, b'n', b'a', b'm']),
+      AtomData::UTF8("Silence".to_string()),
+    ));
+    ilst.insert(Atom::new(
+      AtomIdent::Fourcc(*b"apID"),
+      AtomData::UTF8("someone@example.com".to_string()),
+    ));
+    ilst.insert(Atom::new(
+      AtomIdent::Fourcc(*b"cnID"),
+      AtomData::SignedInteger(1_234_567),
+    ));
+    ilst.save_to_path(&path, WriteOptions::default()).unwrap();
+
+    // Precondition: the generic tags really do lose the atom.
+    let tagged = lofty::read_from_path(&path).unwrap();
+    assert!(
+      !tagged
+        .tags()
+        .iter()
+        .flat_map(|t| t.items())
+        .any(|i| format!("{:?}", i.value()).contains("someone@example.com")),
+      "lofty's generic Tag unexpectedly kept apID",
+    );
+
+    let rows = dump_rows(&path);
+    assert!(
+      rows.contains(&("apID".to_string(), "someone@example.com".to_string())),
+      "apID missing from dump: {rows:?}",
+    );
+    assert!(
+      rows.contains(&("cnID".to_string(), "1234567".to_string())),
+      "cnID missing from dump: {rows:?}",
+    );
+    assert!(
+      rows.contains(&("©nam".to_string(), "Silence".to_string())),
+      "©nam missing from dump: {rows:?}",
+    );
+
+    std::fs::remove_file(&path).unwrap();
+  }
+
+  /// ID3v2 is dumped frame by frame, under the raw frame IDs.
+  #[test]
+  fn dump_shows_id3v2_frames_verbatim() {
+    use lofty::id3::v2::{ExtendedTextFrame, PrivateFrame};
+
+    let path = temp_copy("silence.mp3", "taguar_id3v2_frames.mp3");
+
+    let mut id3v2 = Id3v2Tag::new();
+    id3v2.set_title("Silence".to_string());
+    id3v2.insert(Frame::UserText(ExtendedTextFrame::new(
+      TextEncoding::UTF8,
+      String::from("UNMAPPED_DESC"),
+      String::from("keep me"),
+    )));
+    id3v2.insert(Frame::Private(PrivateFrame::new(
+      "example.com".to_string(),
+      vec![1, 2, 3],
+    )));
+    id3v2.save_to_path(&path, WriteOptions::default()).unwrap();
+
+    let rows = dump_rows(&path);
+    for expected in [
+      // The tag header, which the generic API doesn't expose at all.
+      ("Version".to_string(), "ID3v2.4".to_string()),
+      ("TIT2".to_string(), "Silence".to_string()),
+      ("TXXX:UNMAPPED_DESC".to_string(), "keep me".to_string()),
+      (
+        "PRIV:example.com".to_string(),
+        "[binary] 3 bytes".to_string(),
+      ),
+    ] {
+      assert!(rows.contains(&expected), "{expected:?} missing: {rows:?}");
+    }
+
+    std::fs::remove_file(&path).unwrap();
+  }
+
+  /// Rows are labelled in plain English; the raw identifier stays on the row
+  /// for the hover tooltip and for copying.
+  #[test]
+  fn rows_carry_human_labels_and_raw_keys() {
+    use lofty::id3::v2::ExtendedTextFrame;
+
+    let m4a = temp_copy("silence.m4a", "taguar_labels.m4a");
+    let mut ilst = Ilst::new();
+    ilst.insert(Atom::new(
+      AtomIdent::Fourcc([0xA9, b'A', b'R', b'T']),
+      AtomData::UTF8("Nils Frahm".to_string()),
+    ));
+    ilst.insert(Atom::new(
+      AtomIdent::Fourcc(*b"apID"),
+      AtomData::UTF8("someone@example.com".to_string()),
+    ));
+    ilst.insert(Atom::new(
+      AtomIdent::Fourcc(*b"MYOW"),
+      AtomData::UTF8("no name for this".to_string()),
+    ));
+    ilst.save_to_path(&m4a, WriteOptions::default()).unwrap();
+
+    let rows = dump_metadata_rows(&m4a);
+    assert_eq!(label_of(&rows, "©ART"), "Artist");
+    // Atoms lofty can't map still get a name where we know one.
+    assert_eq!(label_of(&rows, "apID"), "iTunes Account");
+    // …and keep their identifier as the label when we don't, so the tooltip
+    // stays hidden rather than showing the same text twice.
+    assert_eq!(label_of(&rows, "MYOW"), "MYOW");
+    // Plain rows are never relabelled.
+    assert_eq!(label_of(&rows, "Sample Rate"), "Sample Rate");
+    std::fs::remove_file(&m4a).unwrap();
+
+    let mp3 = temp_copy("silence.mp3", "taguar_labels.mp3");
+    let mut id3v2 = Id3v2Tag::new();
+    id3v2.set_title("Says".to_string());
+    id3v2.insert(Frame::UserText(ExtendedTextFrame::new(
+      TextEncoding::UTF8,
+      String::from("DATE_ADDED"),
+      String::from("2026-07-25"),
+    )));
+    id3v2.save_to_path(&mp3, WriteOptions::default()).unwrap();
+
+    let rows = dump_metadata_rows(&mp3);
+    assert_eq!(label_of(&rows, "TIT2"), "Title");
+    // A user-defined frame is named by its description.
+    assert_eq!(label_of(&rows, "TXXX:DATE_ADDED"), "DATE_ADDED");
+    std::fs::remove_file(&mp3).unwrap();
+  }
+
+  /// The generic `FileProperties` has no room for codec details, so they come
+  /// from the format-specific properties.
+  #[test]
+  fn dump_shows_format_specific_audio_properties() {
+    let mp3 = dump_rows(Path::new("tests/fixtures/silence.mp3"));
+    for key in ["MPEG Version", "Layer", "Channel Mode", "Copyrighted"] {
+      assert!(
+        mp3.iter().any(|(k, _)| k == key),
+        "{key} missing from MP3 properties: {mp3:?}",
+      );
+    }
+
+    let m4a = dump_rows(Path::new("tests/fixtures/silence.m4a"));
+    for key in ["Major Brand", "Codec"] {
+      assert!(
+        m4a.iter().any(|(k, _)| k == key),
+        "{key} missing from MP4 properties: {m4a:?}",
+      );
+    }
+  }
+
+  /// Vorbis comments lofty has no mapping for are dropped the same way.
+  #[test]
+  fn dump_shows_unmapped_vorbis_comments() {
+    let path = temp_copy("silence.flac", "taguar_unmapped_comment.flac");
+
+    let mut vc = VorbisComments::default();
+    vc.push("TITLE".to_string(), "Silence".to_string());
+    vc.push("MY_CUSTOM_FIELD".to_string(), "kept".to_string());
+    vc.save_to_path(&path, WriteOptions::default()).unwrap();
+
+    let rows = dump_rows(&path);
+    assert!(
+      rows.contains(&("MY_CUSTOM_FIELD".to_string(), "kept".to_string())),
+      "custom comment missing from dump: {rows:?}",
+    );
+
+    std::fs::remove_file(&path).unwrap();
+  }
 
   #[test]
   fn splits_only_on_the_most_common_separator() {
