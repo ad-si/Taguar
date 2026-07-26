@@ -2503,7 +2503,21 @@ impl Taguar {
       })
       .unwrap_or_default();
 
+    // The metadata button sits in the window's top right corner, above the
+    // form, so it stays put no matter how far the form is scrolled. Without a
+    // selection there's nothing to show, so it's disabled rather than hidden
+    // — otherwise the rest of the sidebar would jump on every first click.
+    let mut all_metadata =
+      button(text("Show All Metadata").size(11)).padding([4, 10]);
+    if self.selected_idx.is_some() {
+      all_metadata = all_metadata.on_press(Message::ShowAllMetadata);
+    }
+
     let mut content = Column::new().spacing(6).push(
+      row![Space::new().width(Length::Fill), all_metadata]
+        .align_y(Alignment::Center),
+    );
+    content = content.push(
       row![
         playback_controls,
         text(file_info_text).size(11).color(MUTED),
@@ -2881,19 +2895,6 @@ impl Taguar {
       );
       content = content.push(Space::new().height(4));
       content = content.push(v1_actions);
-    }
-
-    if self.selected_idx.is_some() {
-      content = content.push(Space::new().height(12));
-      content = content.push(
-        row![
-          Space::new().width(Length::Fill),
-          button(text("Show All Metadata").size(11))
-            .on_press(Message::ShowAllMetadata)
-            .padding([4, 12]),
-        ]
-        .align_y(Alignment::Center),
-      );
     }
 
     scrollable(content.padding(Padding::new(2.0).right(10.0)))
