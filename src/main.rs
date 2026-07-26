@@ -5,8 +5,8 @@ use iced::advanced::widget::{tree, Operation, Tree};
 use iced::advanced::{overlay, renderer, Clipboard, Shell, Widget};
 use iced::widget::{
   button, checkbox, column, container, image, mouse_area, opaque, row,
-  scrollable, slider, stack, text, text_editor, text_input, tooltip, Column,
-  Row, Space,
+  scrollable, slider, stack, svg, text, text_editor, text_input, tooltip,
+  Column, Row, Space,
 };
 use iced::{
   event, keyboard, mouse, Alignment, Background, Border, Color, Element, Event,
@@ -14,7 +14,7 @@ use iced::{
   Vector,
 };
 use lofty::aac::AacFile;
-use lofty::ape::{ApeFile, ApeTag};
+use lofty::ape::{ApeFile, ApeItem, ApeTag};
 use lofty::config::{ParseOptions, WriteOptions};
 use lofty::file::{FileType, TaggedFileExt};
 use lofty::flac::FlacFile;
@@ -24,7 +24,7 @@ use lofty::id3::v2::{
 };
 use lofty::iff::aiff::{AiffFile, AiffTextChunks};
 use lofty::iff::wav::{RiffInfoList, WavFile};
-use lofty::mp4::{AtomData, AtomIdent, DataType, Ilst, Mp4File};
+use lofty::mp4::{Atom, AtomData, AtomIdent, DataType, Ilst, Mp4File};
 use lofty::mpeg::{ChannelMode, Layer, MpegFile, MpegVersion};
 use lofty::musepack::MpcFile;
 use lofty::ogg::{
@@ -66,6 +66,15 @@ const MODAL_SCRIM: Color = Color::from_rgba(0.0, 0.0, 0.0, 0.45);
 
 /// Width of the column-picker dropdown panel.
 const COLUMN_MENU_WIDTH: f32 = 180.0;
+
+/// Width reserved for the delete button at the end of every metadata row —
+/// wide enough for the armed "Delete?" label, so arming a row doesn't shift
+/// the value column.
+const DELETE_COLUMN_WIDTH: f32 = 56.0;
+
+/// Trash can drawn as strokes, so a single colour styles the whole icon. Fira
+/// Sans has no trash glyph, hence the vector.
+const TRASH_ICON: &[u8] = include_bytes!("../images/trash.svg");
 
 const FONT_REGULAR_BYTES: &[u8] =
   include_bytes!("../fonts/FiraSans-Regular.ttf");
@@ -390,6 +399,9 @@ struct Taguar {
   /// sent to the playback thread on release.
   seek_drag_secs: Option<f64>,
   metadata_dump: Option<MetadataDump>,
+  /// Metadata field whose delete button was clicked once — the second click
+  /// on the same field carries out the (irreversible) deletion.
+  pending_delete: Option<FieldTarget>,
   /// Open right-click dropdown within the metadata modal.
   copy_menu: Option<CopyMenu>,
   /// Open right-click dropdown for a song row in the listing.
@@ -444,6 +456,7 @@ impl Default for Taguar {
       playback_pos_secs: 0.0,
       seek_drag_secs: None,
       metadata_dump: None,
+      pending_delete: None,
       copy_menu: None,
       song_menu: None,
       last_cursor: None,
@@ -499,6 +512,20 @@ struct MetadataRow {
   /// hover and used when copying.
   key: String,
   value: String,
+  /// Identifies the underlying tag item so the row can be deleted. `None` for
+  /// rows that aren't tag items (file info, audio properties, tag headers),
+  /// which have nothing to delete.
+  target: Option<FieldTarget>,
+}
+
+/// Points at one item of one tag of the selected file: the position the item
+/// has in the same list the "All Metadata" modal builds its rows from. Keys
+/// can repeat within a tag (two `TXXX` frames, two `ANNO` chunks), so the
+/// position is what identifies a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FieldTarget {
+  tag_type: TagType,
+  index: usize,
 }
 
 impl MetadataRow {
@@ -510,13 +537,24 @@ impl MetadataRow {
       label: key.clone(),
       key,
       value: value.into(),
+      target: None,
     }
   }
 
   /// A tag item, labelled from its raw identifier where a name is known.
-  fn tagged(tag_type: TagType, key: String, value: String) -> Self {
+  fn tagged(
+    tag_type: TagType,
+    index: usize,
+    key: String,
+    value: String,
+  ) -> Self {
     let label = friendly_label(tag_type, &key).unwrap_or_else(|| key.clone());
-    Self { label, key, value }
+    Self {
+      label,
+      key,
+      value,
+      target: Some(FieldTarget { tag_type, index }),
+    }
   }
 }
 
@@ -794,6 +832,10 @@ enum Message {
   DescriptionOpenUrl(String),
   ShowAllMetadata,
   HideAllMetadata,
+  /// Clicked the delete button of a metadata row. The first click only arms
+  /// the button; the second one deletes the field from the file.
+  DeleteMetadataField(FieldTarget),
+  MetadataFieldDeleted(Result<(), String>),
   /// Right-clicked on a metadata row — opens the copy dropdown pinned to
   /// the last known cursor position.
   OpenCopyMenu {
@@ -888,6 +930,50 @@ impl Taguar {
     self.loading = true;
   }
 
+  /// Re-reads the selected file after it was written to, refreshing the form,
+  /// its table row and — while it's open — the metadata modal.
+  fn reload_selected(&mut self) {
+    let Some(idx) = self.selected_idx else {
+      return;
+    };
+    let path = self.files[idx].path.clone();
+
+    // Refresh editable form + cover.
+    let (form, id3v1, label, cover) = load_full(&path);
+    self.lyrics_content = text_editor::Content::with_text(&form.lyrics);
+    self.comment_content = text_editor::Content::with_text(&form.comment);
+    self.description_contents = form
+      .descriptions
+      .iter()
+      .map(|d| text_editor::Content::with_text(d))
+      .collect();
+    self.form = form.clone();
+    self.saved_form = form;
+    self.clear_pill_drafts();
+    self.id3v1 = id3v1;
+    self.primary_tag_label = label;
+    self.cover = cover;
+
+    // Refresh the file's row in the table.
+    if let Ok(mut info) = load_file_info(&path) {
+      if let Some(Source::Directory(root)) = &self.source {
+        info.filename = path
+          .strip_prefix(root)
+          .unwrap_or(&path)
+          .to_string_lossy()
+          .into_owned();
+      }
+      self.files[idx] = info;
+    }
+
+    if self.metadata_dump.is_some() {
+      self.metadata_dump = Some(load_metadata_dump(&path));
+      // Row positions shift as items go away, so an armed delete button would
+      // point at the wrong field.
+      self.pending_delete = None;
+    }
+  }
+
   fn update(&mut self, message: Message) -> Task<Message> {
     match message {
       Message::SelectDirectory => Task::perform(
@@ -964,7 +1050,8 @@ impl Taguar {
         }
         self.nav_warning = false;
         if let Some(info) = self.files.get(idx) {
-          let (form, id3v1, label, cover) = load_full(&info.path);
+          let path = info.path.clone();
+          let (form, id3v1, label, cover) = load_full(&path);
           self.lyrics_content = text_editor::Content::with_text(&form.lyrics);
           self.comment_content = text_editor::Content::with_text(&form.comment);
           self.description_contents = form
@@ -980,6 +1067,13 @@ impl Taguar {
           self.cover = cover;
           self.selected_idx = Some(idx);
           self.status = None;
+          // The modal stays open when the selection moves by keyboard, so it
+          // has to follow along — otherwise its rows (and their delete
+          // buttons) would still point at the previous file.
+          if self.metadata_dump.is_some() {
+            self.metadata_dump = Some(load_metadata_dump(&path));
+            self.pending_delete = None;
+          }
         }
         Task::none()
       }
@@ -1358,35 +1452,7 @@ impl Taguar {
       Message::Saved(Ok(())) => {
         self.status = Some("Saved.".to_string());
         self.nav_warning = false;
-        if let Some(idx) = self.selected_idx {
-          let path = self.files[idx].path.clone();
-          // Refresh editable form + cover.
-          let (form, id3v1, label, cover) = load_full(&path);
-          self.lyrics_content = text_editor::Content::with_text(&form.lyrics);
-          self.comment_content = text_editor::Content::with_text(&form.comment);
-          self.description_contents = form
-            .descriptions
-            .iter()
-            .map(|d| text_editor::Content::with_text(d))
-            .collect();
-          self.form = form.clone();
-          self.saved_form = form;
-          self.clear_pill_drafts();
-          self.id3v1 = id3v1;
-          self.primary_tag_label = label;
-          self.cover = cover;
-          // Refresh the file's row in the table.
-          if let Ok(mut info) = load_file_info(&path) {
-            if let Some(Source::Directory(root)) = &self.source {
-              info.filename = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .into_owned();
-            }
-            self.files[idx] = info;
-          }
-        }
+        self.reload_selected();
         Task::none()
       }
       Message::Saved(Err(e)) => {
@@ -1523,13 +1589,7 @@ impl Taguar {
       Message::Id3v1Deleted(Ok(())) => {
         self.status = Some("ID3v1 tag deleted.".to_string());
         self.id3v1 = None;
-        // Refresh metadata dump if open.
-        if let Some(idx) = self.selected_idx {
-          if self.metadata_dump.is_some() {
-            self.metadata_dump =
-              Some(load_metadata_dump(&self.files[idx].path));
-          }
-        }
+        self.reload_selected();
         Task::none()
       }
       Message::Id3v1Deleted(Err(e)) => {
@@ -1548,15 +1608,53 @@ impl Taguar {
         if let Some(idx) = self.selected_idx {
           if let Some(info) = self.files.get(idx) {
             self.metadata_dump = Some(load_metadata_dump(&info.path));
+            self.pending_delete = None;
           }
         }
         Task::none()
       }
       Message::HideAllMetadata => {
         self.metadata_dump = None;
+        self.pending_delete = None;
         self.copy_menu = None;
         self.copy_feedback = None;
         self.last_cursor = None;
+        Task::none()
+      }
+      Message::DeleteMetadataField(target) => {
+        // Deleting rewrites the file with no way back, so the first click only
+        // arms the button.
+        if self.pending_delete != Some(target) {
+          self.pending_delete = Some(target);
+          self.copy_feedback = None;
+          return Task::none();
+        }
+        self.pending_delete = None;
+
+        let Some(idx) = self.selected_idx else {
+          return Task::none();
+        };
+        let path = self.files[idx].path.clone();
+        self.status = Some("Deleting field...".to_string());
+        Task::perform(
+          async move {
+            tokio::task::spawn_blocking(move || {
+              delete_metadata_field(&path, target)
+            })
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|r| r)
+          },
+          Message::MetadataFieldDeleted,
+        )
+      }
+      Message::MetadataFieldDeleted(Ok(())) => {
+        self.status = Some("Field deleted.".to_string());
+        self.reload_selected();
+        Task::none()
+      }
+      Message::MetadataFieldDeleted(Err(e)) => {
+        self.status = Some(format!("Error deleting field: {e}"));
         Task::none()
       }
       Message::OpenCopyMenu { key, value } => {
@@ -2922,9 +3020,12 @@ impl Taguar {
       column![
         header_row,
         Space::new().height(8),
-        text("Tip: right-click any value to copy it.")
-          .size(10)
-          .color(MUTED),
+        text(
+          "Tip: right-click any value to copy it, \
+           or use the trash icon to delete a field."
+        )
+        .size(10)
+        .color(MUTED),
         Space::new().height(6),
         scrollable(body).spacing(8).height(Length::Fill),
       ]
@@ -2997,7 +3098,9 @@ impl Taguar {
       value: metadata_row.value.clone(),
     });
 
-    row![label, value_area]
+    let delete = delete_button_view(metadata_row.target, self.pending_delete);
+
+    row![label, value_area, delete]
       .width(Length::Fill)
       .spacing(10)
       .align_y(Alignment::Start)
@@ -3211,6 +3314,96 @@ fn pill_style(_theme: &Theme) -> container::Style {
       radius: 8.0.into(),
     },
     ..container::Style::default()
+  }
+}
+
+/// The delete button at the end of a metadata row, armed into a confirmation
+/// once clicked. Rows that aren't tag items (file info, audio properties, tag
+/// headers) get an empty spacer of the same width instead, so the value
+/// column keeps its width throughout.
+fn delete_button_view(
+  target: Option<FieldTarget>,
+  pending: Option<FieldTarget>,
+) -> Element<'static, Message> {
+  fn area(content: Element<'static, Message>) -> Element<'static, Message> {
+    container(content)
+      .width(Length::Fixed(DELETE_COLUMN_WIDTH))
+      .align_x(Alignment::End)
+      .into()
+  }
+
+  let Some(target) = target else {
+    return area(Space::new().into());
+  };
+
+  if pending == Some(target) {
+    return area(pointer(
+      button(text("Delete?").size(11))
+        .on_press(Message::DeleteMetadataField(target))
+        .padding([0, 4])
+        .style(delete_confirm_button_style),
+    ));
+  }
+
+  let trash = svg(svg::Handle::from_memory(TRASH_ICON))
+    .width(Length::Fixed(13.0))
+    .height(Length::Fixed(13.0))
+    .style(trash_icon_style);
+
+  area(pointer(tooltip(
+    button(trash)
+      .on_press(Message::DeleteMetadataField(target))
+      .padding([1, 4])
+      .style(pill_remove_button_style),
+    container(text("Delete this field").size(11))
+      .padding([2, 6])
+      .style(tooltip_style),
+    tooltip::Position::Left,
+  )))
+}
+
+/// Shows the hand cursor over `content`, for clickable things whose own
+/// widget doesn't ask for one (an SVG inside a button reports no interaction
+/// of its own, and the tooltip wrapper passes that through).
+fn pointer<'a>(
+  content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+  mouse_area(content)
+    .interaction(mouse::Interaction::Pointer)
+    .into()
+}
+
+/// The trash icon of a metadata row, tinted like the pill remove button it
+/// sits next to (the button's own `text_color` doesn't reach an SVG).
+fn trash_icon_style(_theme: &Theme, status: svg::Status) -> svg::Style {
+  let color = match status {
+    svg::Status::Hovered => Color::from_rgb(0.85, 0.2, 0.2),
+    svg::Status::Idle => MUTED,
+  };
+  svg::Style { color: Some(color) }
+}
+
+/// The armed state of a metadata row's delete button: the next click writes
+/// the file, so it reads as a warning.
+fn delete_confirm_button_style(
+  _theme: &Theme,
+  status: button::Status,
+) -> button::Style {
+  let bg = match status {
+    button::Status::Hovered | button::Status::Pressed => {
+      Color::from_rgb(0.70, 0.15, 0.15)
+    }
+    _ => Color::from_rgb(0.85, 0.2, 0.2),
+  };
+  button::Style {
+    background: Some(Background::Color(bg)),
+    text_color: Color::WHITE,
+    border: Border {
+      color: Color::TRANSPARENT,
+      width: 0.0,
+      radius: 4.0.into(),
+    },
+    ..button::Style::default()
   }
 }
 
@@ -4118,17 +4311,11 @@ fn load_native_metadata(path: &Path, file_type: FileType) -> NativeMetadata {
         props.push(prop_row("MD5 Signature", format!("{signature:032x}")));
       }
       if let Some(t) = f.vorbis_comments() {
-        let mut section = vorbis_section(t);
         // FLAC keeps its pictures in native PICTURE metadata blocks rather
         // than in the Vorbis comment block.
-        let mut pictures = Vec::new();
-        push_picture_rows(&mut pictures, f.pictures().iter().map(|(p, _)| p));
-        section.rows.extend(
-          pictures
-            .into_iter()
-            .map(|(key, value)| MetadataRow::plain(key, value)),
-        );
-        sections.push(section);
+        let pictures: Vec<Picture> =
+          f.pictures().iter().map(|(p, _)| p.clone()).collect();
+        sections.push(vorbis_section(t, &pictures));
       }
       if let Some(t) = f.id3v2() {
         sections.push(id3v2_section(t));
@@ -4149,7 +4336,7 @@ fn load_native_metadata(path: &Path, file_type: FileType) -> NativeMetadata {
           props.push(prop_row(key, format!("{bitrate} bps")));
         }
       }
-      sections.push(vorbis_section(f.vorbis_comments()));
+      sections.push(vorbis_section(f.vorbis_comments(), &[]));
     }
     FileType::Opus => {
       let Ok(f) = OpusFile::read_from(&mut reader, opts) else {
@@ -4162,7 +4349,7 @@ fn load_native_metadata(path: &Path, file_type: FileType) -> NativeMetadata {
         format!("{} Hz", p.input_sample_rate()),
       ));
       push_channel_mask(&mut props, Some(p.channel_mask()));
-      sections.push(vorbis_section(f.vorbis_comments()));
+      sections.push(vorbis_section(f.vorbis_comments(), &[]));
     }
     FileType::Speex => {
       let Ok(f) = SpeexFile::read_from(&mut reader, opts) else {
@@ -4178,7 +4365,7 @@ fn load_native_metadata(path: &Path, file_type: FileType) -> NativeMetadata {
           format!("{} bps", p.nominal_bitrate()),
         ));
       }
-      sections.push(vorbis_section(f.vorbis_comments()));
+      sections.push(vorbis_section(f.vorbis_comments(), &[]));
     }
     FileType::Wav => {
       let Ok(f) = WavFile::read_from(&mut reader, opts) else {
@@ -4300,7 +4487,10 @@ fn tag_section(
     heading: format!("{} ({} items)", tag_type_label(tag_type), rows.len()),
     rows: rows
       .into_iter()
-      .map(|(key, value)| MetadataRow::tagged(tag_type, key, value))
+      .enumerate()
+      .map(|(index, (key, value))| {
+        MetadataRow::tagged(tag_type, index, key, value)
+      })
       .collect(),
   }
 }
@@ -4783,8 +4973,18 @@ fn be_int(data: &[u8], signed: bool) -> i64 {
 
 /// The Vorbis Comments section. The vendor string is a header field rather
 /// than a comment, so it sits above the items and outside the item count.
-fn vorbis_section(tag: &VorbisComments) -> MetadataSection {
-  let mut section = tag_section(TagType::VorbisComments, vorbis_rows(tag));
+///
+/// `extra_pictures` carries FLAC's picture blocks. They live outside the
+/// comment block, but lofty writes them from the same tag, so they're listed
+/// (and numbered) as if they were the tag's own trailing pictures — see
+/// [`delete_metadata_field`].
+fn vorbis_section(
+  tag: &VorbisComments,
+  extra_pictures: &[Picture],
+) -> MetadataSection {
+  let mut rows = vorbis_rows(tag);
+  push_picture_rows(&mut rows, extra_pictures.iter());
+  let mut section = tag_section(TagType::VorbisComments, rows);
   if !tag.vendor().is_empty() {
     section
       .rows
@@ -5348,6 +5548,440 @@ fn delete_id3v1_tag(path: &Path) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
+/// One tag of a file, in the same native form the "All Metadata" modal lists
+/// it in, so a [`FieldTarget`] can be resolved against it.
+enum NativeTag {
+  Id3v2(Id3v2Tag),
+  Id3v1(Id3v1Tag),
+  Ape(ApeTag),
+  Ilst(Ilst),
+  Vorbis(VorbisComments),
+  RiffInfo(RiffInfoList),
+  AiffText(AiffTextChunks),
+  /// lofty's generic tag, for the file types [`load_native_metadata`] has no
+  /// native reader for — the modal lists those through
+  /// [`generic_tag_sections`], so they're edited through the same API.
+  Generic(Tag),
+}
+
+/// Removes the single tag item `target` points at from `path` and writes the
+/// tag back.
+fn delete_metadata_field(
+  path: &Path,
+  target: FieldTarget,
+) -> Result<(), String> {
+  let tagged_file =
+    lofty::read_from_path(path).map_err(|e| format!("read file: {e}"))?;
+
+  let mut tag =
+    match native_tag(path, tagged_file.file_type(), target.tag_type)? {
+      Some(tag) => tag,
+      None => NativeTag::Generic(
+        tagged_file
+          .tags()
+          .iter()
+          .find(|tag| tag.tag_type() == target.tag_type)
+          .cloned()
+          .ok_or_else(|| missing_tag(target.tag_type))?,
+      ),
+    };
+
+  tag.remove_index(target.index)?;
+  tag.write_to(path)
+}
+
+/// Reads the `tag_type` tag of `path` in its native form, mirroring
+/// [`load_native_metadata`]. `None` means the file type has no native reader
+/// here, leaving the caller to fall back to lofty's generic tags.
+fn native_tag(
+  path: &Path,
+  file_type: FileType,
+  tag_type: TagType,
+) -> Result<Option<NativeTag>, String> {
+  let file = File::open(path).map_err(|e| format!("open file: {e}"))?;
+  let mut reader = BufReader::new(file);
+  let opts = ParseOptions::new();
+
+  let tag = match file_type {
+    FileType::Mpeg => {
+      let f = read_native::<MpegFile>(&mut reader, opts, file_type)?;
+      match tag_type {
+        TagType::Id3v2 => f.id3v2().cloned().map(NativeTag::Id3v2),
+        TagType::Id3v1 => f.id3v1().cloned().map(NativeTag::Id3v1),
+        TagType::Ape => f.ape().cloned().map(NativeTag::Ape),
+        _ => None,
+      }
+    }
+    FileType::Aac => {
+      let f = read_native::<AacFile>(&mut reader, opts, file_type)?;
+      match tag_type {
+        TagType::Id3v2 => f.id3v2().cloned().map(NativeTag::Id3v2),
+        TagType::Id3v1 => f.id3v1().cloned().map(NativeTag::Id3v1),
+        _ => None,
+      }
+    }
+    FileType::Mp4 => {
+      let f = read_native::<Mp4File>(&mut reader, opts, file_type)?;
+      match tag_type {
+        TagType::Mp4Ilst => f.ilst().cloned().map(NativeTag::Ilst),
+        _ => None,
+      }
+    }
+    FileType::Flac => {
+      let f = read_native::<FlacFile>(&mut reader, opts, file_type)?;
+      match tag_type {
+        TagType::VorbisComments => match f.vorbis_comments() {
+          Some(tag) => {
+            let mut tag = tag.clone();
+            // The modal lists FLAC's picture blocks as the tag's trailing
+            // pictures, and lofty writes every picture of a `VorbisComments`
+            // tag back as a picture block, so folding them in here keeps both
+            // the numbering and the untouched pictures.
+            for (picture, info) in f.pictures() {
+              tag
+                .insert_picture(picture.clone(), Some(*info))
+                .map_err(|e| format!("read pictures: {e}"))?;
+            }
+            Some(NativeTag::Vorbis(tag))
+          }
+          None => None,
+        },
+        TagType::Id3v2 => return Err(read_only_tag(tag_type, file_type)),
+        _ => None,
+      }
+    }
+    FileType::Vorbis => {
+      let f = read_native::<VorbisFile>(&mut reader, opts, file_type)?;
+      vorbis_native_tag(f.vorbis_comments(), tag_type)
+    }
+    FileType::Opus => {
+      let f = read_native::<OpusFile>(&mut reader, opts, file_type)?;
+      vorbis_native_tag(f.vorbis_comments(), tag_type)
+    }
+    FileType::Speex => {
+      let f = read_native::<SpeexFile>(&mut reader, opts, file_type)?;
+      vorbis_native_tag(f.vorbis_comments(), tag_type)
+    }
+    FileType::Wav => {
+      let f = read_native::<WavFile>(&mut reader, opts, file_type)?;
+      match tag_type {
+        TagType::RiffInfo => f.riff_info().cloned().map(NativeTag::RiffInfo),
+        TagType::Id3v2 => f.id3v2().cloned().map(NativeTag::Id3v2),
+        _ => None,
+      }
+    }
+    FileType::Aiff => {
+      let f = read_native::<AiffFile>(&mut reader, opts, file_type)?;
+      match tag_type {
+        TagType::AiffText => f.text_chunks().cloned().map(NativeTag::AiffText),
+        TagType::Id3v2 => f.id3v2().cloned().map(NativeTag::Id3v2),
+        _ => None,
+      }
+    }
+    FileType::Ape => {
+      let f = read_native::<ApeFile>(&mut reader, opts, file_type)?;
+      match tag_type {
+        TagType::Ape => f.ape().cloned().map(NativeTag::Ape),
+        TagType::Id3v1 => f.id3v1().cloned().map(NativeTag::Id3v1),
+        TagType::Id3v2 => return Err(read_only_tag(tag_type, file_type)),
+        _ => None,
+      }
+    }
+    FileType::WavPack => {
+      let f = read_native::<WavPackFile>(&mut reader, opts, file_type)?;
+      match tag_type {
+        TagType::Ape => f.ape().cloned().map(NativeTag::Ape),
+        TagType::Id3v1 => f.id3v1().cloned().map(NativeTag::Id3v1),
+        _ => None,
+      }
+    }
+    FileType::Mpc => {
+      let f = read_native::<MpcFile>(&mut reader, opts, file_type)?;
+      match tag_type {
+        TagType::Ape => f.ape().cloned().map(NativeTag::Ape),
+        TagType::Id3v2 | TagType::Id3v1 => {
+          return Err(read_only_tag(tag_type, file_type))
+        }
+        _ => None,
+      }
+    }
+    _ => return Ok(None),
+  };
+
+  // The file type has a native reader, so a missing tag here means the file
+  // no longer holds the tag the row was read from.
+  tag.map(Some).ok_or_else(|| missing_tag(tag_type))
+}
+
+fn read_native<F: AudioFile>(
+  reader: &mut BufReader<File>,
+  opts: ParseOptions,
+  file_type: FileType,
+) -> Result<F, String> {
+  F::read_from(reader, opts).map_err(|e| format!("read {file_type:?}: {e}"))
+}
+
+fn vorbis_native_tag(
+  tag: &VorbisComments,
+  tag_type: TagType,
+) -> Option<NativeTag> {
+  match tag_type {
+    TagType::VorbisComments => Some(NativeTag::Vorbis(tag.clone())),
+    _ => None,
+  }
+}
+
+fn missing_tag(tag_type: TagType) -> String {
+  format!("no {} tag in the file", tag_type_label(tag_type))
+}
+
+/// lofty reads some tags out of containers it can't write them back to.
+fn read_only_tag(tag_type: TagType, file_type: FileType) -> String {
+  format!(
+    "{} tags are read-only in {file_type:?} files",
+    tag_type_label(tag_type)
+  )
+}
+
+fn stale_field(index: usize, count: usize) -> String {
+  format!("field #{index} is gone (the tag has {count} items now)")
+}
+
+impl NativeTag {
+  /// Removes the item at `index` of the tag's item list — the very list, in
+  /// the same order, that [`load_metadata_dump`] builds its rows from.
+  fn remove_index(&mut self, index: usize) -> Result<(), String> {
+    match self {
+      NativeTag::Id3v2(tag) => {
+        let mut seen = 0;
+        tag.retain(|_| {
+          let keep = seen != index;
+          seen += 1;
+          keep
+        });
+        if index >= seen {
+          return Err(stale_field(index, seen));
+        }
+        Ok(())
+      }
+      NativeTag::Id3v1(tag) => {
+        // `id3v1_rows` lists only the fields that are set, in this order.
+        let present: Vec<usize> = [
+          tag.title.is_some(),
+          tag.artist.is_some(),
+          tag.album.is_some(),
+          tag.year.is_some(),
+          tag.comment.is_some(),
+          tag.track_number.is_some(),
+          tag.genre.is_some(),
+        ]
+        .into_iter()
+        .enumerate()
+        .filter(|(_, is_set)| *is_set)
+        .map(|(field, _)| field)
+        .collect();
+
+        match present.get(index).copied() {
+          Some(0) => tag.title = None,
+          Some(1) => tag.artist = None,
+          Some(2) => tag.album = None,
+          Some(3) => tag.year = None,
+          Some(4) => tag.comment = None,
+          Some(5) => tag.track_number = None,
+          Some(6) => tag.genre = None,
+          _ => return Err(stale_field(index, present.len())),
+        }
+        Ok(())
+      }
+      NativeTag::Ape(tag) => {
+        let read_only = tag.read_only;
+        let mut items: Vec<ApeItem> = std::mem::take(tag).into_iter().collect();
+        let count = items.len();
+        let found = index < count;
+        if found {
+          items.remove(index);
+        }
+        // Rebuilding keeps the remaining items in their original order.
+        let mut rebuilt = ApeTag::new();
+        rebuilt.read_only = read_only;
+        for item in items {
+          rebuilt.push(item);
+        }
+        *tag = rebuilt;
+        if found {
+          Ok(())
+        }
+        else {
+          Err(stale_field(index, count))
+        }
+      }
+      NativeTag::Ilst(tag) => {
+        // `ilst_rows` lists one row per value, and an atom can hold several.
+        let mut remaining = index;
+        let mut found = false;
+        let mut count = 0;
+        let mut rebuilt = Ilst::new();
+        for atom in std::mem::take(tag) {
+          let ident = atom.ident().clone().into_owned();
+          let mut values: Vec<AtomData> = atom.into_data().collect();
+          count += values.len();
+          if !found {
+            if remaining < values.len() {
+              values.remove(remaining);
+              found = true;
+            }
+            else {
+              remaining -= values.len();
+            }
+          }
+          if let Some(atom) = Atom::from_collection(ident, values) {
+            rebuilt.insert(atom);
+          }
+        }
+        *tag = rebuilt;
+        if found {
+          Ok(())
+        }
+        else {
+          Err(stale_field(index, count))
+        }
+      }
+      NativeTag::Vorbis(tag) => {
+        // `vorbis_rows` lists the comments, then the pictures.
+        let mut items: Vec<(String, String)> = tag.take_items().collect();
+        let item_count = items.len();
+        let found = index < item_count;
+        if found {
+          items.remove(index);
+        }
+        for (key, value) in items {
+          tag.push(key, value);
+        }
+        if found {
+          return Ok(());
+        }
+
+        let picture_index = index - item_count;
+        if picture_index >= tag.pictures().len() {
+          return Err(stale_field(index, item_count + tag.pictures().len()));
+        }
+        tag.remove_picture(picture_index);
+        Ok(())
+      }
+      NativeTag::RiffInfo(tag) => {
+        let mut items: Vec<(String, String)> =
+          std::mem::take(tag).into_iter().collect();
+        let count = items.len();
+        let found = index < count;
+        if found {
+          items.remove(index);
+        }
+        let mut rebuilt = RiffInfoList::default();
+        for (key, value) in items {
+          rebuilt.insert(key, value);
+        }
+        *tag = rebuilt;
+        if found {
+          Ok(())
+        }
+        else {
+          Err(stale_field(index, count))
+        }
+      }
+      NativeTag::AiffText(tag) => {
+        // `aiff_text_rows` lists the three single-value chunks, then the
+        // annotations, then the comments.
+        let mut index = index;
+        for chunk in [&mut tag.name, &mut tag.author, &mut tag.copyright] {
+          if chunk.is_some() {
+            if index == 0 {
+              *chunk = None;
+              return Ok(());
+            }
+            index -= 1;
+          }
+        }
+
+        let annotations = tag.annotations.as_ref().map_or(0, Vec::len);
+        if index < annotations {
+          if let Some(annotations) = &mut tag.annotations {
+            annotations.remove(index);
+          }
+          if tag.annotations.as_ref().is_some_and(Vec::is_empty) {
+            tag.annotations = None;
+          }
+          return Ok(());
+        }
+        index -= annotations;
+
+        let comments = tag.comments.as_ref().map_or(0, Vec::len);
+        if index < comments {
+          if let Some(comments) = &mut tag.comments {
+            comments.remove(index);
+          }
+          if tag.comments.as_ref().is_some_and(Vec::is_empty) {
+            tag.comments = None;
+          }
+          return Ok(());
+        }
+        Err(stale_field(index, comments))
+      }
+      NativeTag::Generic(tag) => {
+        // `generic_tag_sections` lists the items, then the pictures.
+        let item_count = tag.items().count();
+        if index < item_count {
+          let mut seen = 0;
+          tag.retain(|_| {
+            let keep = seen != index;
+            seen += 1;
+            keep
+          });
+          return Ok(());
+        }
+
+        let picture_index = index - item_count;
+        if picture_index >= tag.pictures().len() {
+          return Err(stale_field(index, item_count + tag.pictures().len()));
+        }
+        tag.remove_picture(picture_index);
+        Ok(())
+      }
+    }
+  }
+
+  fn write_to(&self, path: &Path) -> Result<(), String> {
+    match self {
+      NativeTag::Id3v2(tag) => store_tag(tag, path),
+      NativeTag::Id3v1(tag) => store_tag(tag, path),
+      NativeTag::Ape(tag) => store_tag(tag, path),
+      NativeTag::Ilst(tag) => store_tag(tag, path),
+      NativeTag::Vorbis(tag) => store_tag(tag, path),
+      NativeTag::RiffInfo(tag) => store_tag(tag, path),
+      NativeTag::AiffText(tag) => store_tag(tag, path),
+      NativeTag::Generic(tag) => store_tag(tag, path),
+    }
+  }
+}
+
+/// Writes `tag` back to `path`, stripping it outright once its last item is
+/// gone so no empty tag is left behind.
+fn store_tag<T>(tag: &T, path: &Path) -> Result<(), String>
+where
+  T: TagExt,
+  T::Err: std::fmt::Display,
+{
+  if tag.is_empty() {
+    tag
+      .remove_from_path(path)
+      .map_err(|e| format!("remove tag: {e}"))
+  }
+  else {
+    tag
+      .save_to_path(path, WriteOptions::default())
+      .map_err(|e| format!("write tag: {e}"))
+  }
+}
+
 fn apply_picture_change(
   tag: &mut Tag,
   change: PictureChange,
@@ -5809,7 +6443,6 @@ mod tests {
   use super::split_into_values;
   use super::title_from_filename;
   use super::*;
-  use lofty::mp4::Atom;
 
   /// Copies a fixture to a uniquely named temp file for destructive tests.
   fn temp_copy(fixture: &str, name: &str) -> PathBuf {
@@ -5831,6 +6464,23 @@ mod tests {
     dump_metadata_rows(path)
       .into_iter()
       .map(|r| (r.key, r.value))
+      .collect()
+  }
+
+  /// The delete target of the row stored under `key`.
+  fn target_of(path: &Path, key: &str) -> FieldTarget {
+    dump_metadata_rows(path)
+      .into_iter()
+      .find(|r| r.key == key)
+      .unwrap_or_else(|| panic!("no row for {key}"))
+      .target
+      .unwrap_or_else(|| panic!("row {key} has no delete target"))
+  }
+
+  fn keys_of(path: &Path) -> Vec<String> {
+    dump_metadata_rows(path)
+      .into_iter()
+      .map(|r| r.key)
       .collect()
   }
 
@@ -6016,6 +6666,294 @@ mod tests {
       rows.contains(&("MY_CUSTOM_FIELD".to_string(), "kept".to_string())),
       "custom comment missing from dump: {rows:?}",
     );
+
+    std::fs::remove_file(&path).unwrap();
+  }
+
+  /// Only tag items can be deleted; the file, properties and tag-header rows
+  /// have nothing behind them to remove.
+  #[test]
+  fn only_tag_items_are_deletable() {
+    let rows = dump_metadata_rows(Path::new("tests/fixtures/silence.mp3"));
+    for key in ["Path", "Sample Rate", "File Size", "Version"] {
+      let row = rows.iter().find(|r| r.key == key).unwrap();
+      assert!(row.target.is_none(), "{key} should not be deletable");
+    }
+  }
+
+  /// Deleting an ID3v2 frame leaves every other frame in place, including the
+  /// ones lofty's generic `Tag` can't represent.
+  #[test]
+  fn deletes_a_single_id3v2_frame() {
+    use lofty::id3::v2::ExtendedTextFrame;
+
+    let path = temp_copy("silence.mp3", "taguar_delete_id3v2.mp3");
+
+    let mut id3v2 = Id3v2Tag::new();
+    id3v2.set_title("Silence".to_string());
+    id3v2.set_artist("Nils Frahm".to_string());
+    id3v2.insert(Frame::UserText(ExtendedTextFrame::new(
+      TextEncoding::UTF8,
+      String::from("DATE_ADDED"),
+      String::from("2026-07-25"),
+    )));
+    id3v2.save_to_path(&path, WriteOptions::default()).unwrap();
+
+    delete_metadata_field(&path, target_of(&path, "TPE1")).unwrap();
+
+    let rows = dump_rows(&path);
+    assert!(
+      rows.contains(&("TIT2".to_string(), "Silence".to_string())),
+      "title was lost: {rows:?}",
+    );
+    assert!(
+      rows.contains(&("TXXX:DATE_ADDED".to_string(), "2026-07-25".to_string())),
+      "user-defined frame was lost: {rows:?}",
+    );
+    assert!(
+      !keys_of(&path).contains(&"TPE1".to_string()),
+      "artist frame is still there: {rows:?}",
+    );
+
+    std::fs::remove_file(&path).unwrap();
+  }
+
+  /// Two frames can share an identifier, so rows are deleted by position —
+  /// deleting the first `TXXX` frame must keep the second one.
+  #[test]
+  fn deletes_the_right_one_of_two_frames_sharing_an_id() {
+    use lofty::id3::v2::ExtendedTextFrame;
+
+    let path = temp_copy("silence.mp3", "taguar_delete_duplicate_id.mp3");
+
+    let mut id3v2 = Id3v2Tag::new();
+    for description in ["DATE_ADDED", "AUDIO_SOURCE"] {
+      id3v2.insert(Frame::UserText(ExtendedTextFrame::new(
+        TextEncoding::UTF8,
+        description.to_string(),
+        format!("value of {description}"),
+      )));
+    }
+    id3v2.save_to_path(&path, WriteOptions::default()).unwrap();
+
+    delete_metadata_field(&path, target_of(&path, "TXXX:DATE_ADDED")).unwrap();
+
+    let keys = keys_of(&path);
+    assert!(
+      keys.contains(&"TXXX:AUDIO_SOURCE".to_string()),
+      "the wrong frame was deleted: {keys:?}",
+    );
+    assert!(
+      !keys.contains(&"TXXX:DATE_ADDED".to_string()),
+      "the frame is still there: {keys:?}",
+    );
+
+    std::fs::remove_file(&path).unwrap();
+  }
+
+  /// MP4 atoms without an `ItemKey` mapping are dumped natively, and they're
+  /// deleted natively as well — without dropping the ones next to them.
+  #[test]
+  fn deletes_an_mp4_atom_without_an_item_key() {
+    let path = temp_copy("silence.m4a", "taguar_delete_atom.m4a");
+
+    let mut ilst = Ilst::new();
+    ilst.insert(Atom::new(
+      AtomIdent::Fourcc([0xA9, b'n', b'a', b'm']),
+      AtomData::UTF8("Silence".to_string()),
+    ));
+    ilst.insert(Atom::new(
+      AtomIdent::Fourcc(*b"apID"),
+      AtomData::UTF8("someone@example.com".to_string()),
+    ));
+    ilst.save_to_path(&path, WriteOptions::default()).unwrap();
+
+    delete_metadata_field(&path, target_of(&path, "apID")).unwrap();
+
+    let rows = dump_rows(&path);
+    assert!(
+      rows.contains(&("©nam".to_string(), "Silence".to_string())),
+      "title atom was lost: {rows:?}",
+    );
+    assert!(
+      !keys_of(&path).contains(&"apID".to_string()),
+      "apID is still there: {rows:?}",
+    );
+
+    std::fs::remove_file(&path).unwrap();
+  }
+
+  /// FLAC keeps its pictures outside the comment block, so deleting a comment
+  /// must not take the cover art with it.
+  #[test]
+  fn deletes_a_vorbis_comment_and_keeps_the_picture() {
+    use lofty::picture::{MimeType, PictureInformation};
+
+    let path = temp_copy("silence.flac", "taguar_delete_comment.flac");
+
+    let mut vc = VorbisComments::default();
+    vc.push("TITLE".to_string(), "Silence".to_string());
+    vc.push("MY_CUSTOM_FIELD".to_string(), "kept".to_string());
+    vc.insert_picture(
+      Picture::unchecked(vec![1, 2, 3])
+        .pic_type(PictureType::CoverFront)
+        .mime_type(MimeType::Png)
+        .build(),
+      Some(PictureInformation::default()),
+    )
+    .unwrap();
+    vc.save_to_path(&path, WriteOptions::default()).unwrap();
+
+    delete_metadata_field(&path, target_of(&path, "TITLE")).unwrap();
+
+    let rows = dump_rows(&path);
+    assert!(
+      rows.contains(&("MY_CUSTOM_FIELD".to_string(), "kept".to_string())),
+      "custom comment was lost: {rows:?}",
+    );
+    assert!(
+      !keys_of(&path).contains(&"TITLE".to_string()),
+      "title comment is still there: {rows:?}",
+    );
+    assert!(
+      keys_of(&path).contains(&"Picture #1".to_string()),
+      "the picture was lost: {rows:?}",
+    );
+
+    // Deleting the last comment still leaves the picture alone, rather than
+    // stripping the tag it's written through.
+    delete_metadata_field(&path, target_of(&path, "MY_CUSTOM_FIELD")).unwrap();
+    let keys = keys_of(&path);
+    assert!(
+      keys.contains(&"Picture #1".to_string()),
+      "the picture was stripped along with the last comment: {keys:?}",
+    );
+
+    std::fs::remove_file(&path).unwrap();
+  }
+
+  /// FLAC's picture blocks are listed as trailing items of the Vorbis tag, so
+  /// they're deletable through it too.
+  #[test]
+  fn deletes_a_flac_picture() {
+    use lofty::picture::{MimeType, PictureInformation};
+
+    let path = temp_copy("silence.flac", "taguar_delete_picture.flac");
+
+    let mut vc = VorbisComments::default();
+    vc.push("TITLE".to_string(), "Silence".to_string());
+    vc.insert_picture(
+      Picture::unchecked(vec![1, 2, 3])
+        .pic_type(PictureType::CoverFront)
+        .mime_type(MimeType::Png)
+        .build(),
+      Some(PictureInformation::default()),
+    )
+    .unwrap();
+    vc.save_to_path(&path, WriteOptions::default()).unwrap();
+
+    delete_metadata_field(&path, target_of(&path, "Picture #1")).unwrap();
+
+    let rows = dump_rows(&path);
+    assert!(
+      rows.contains(&("TITLE".to_string(), "Silence".to_string())),
+      "title comment was lost: {rows:?}",
+    );
+    assert!(
+      !keys_of(&path).contains(&"Picture #1".to_string()),
+      "the picture is still there: {rows:?}",
+    );
+
+    std::fs::remove_file(&path).unwrap();
+  }
+
+  /// An MP3 can carry both tags; deleting an ID3v1 field must leave the ID3v2
+  /// frames alone.
+  #[test]
+  fn deletes_an_id3v1_field_only() {
+    let path = temp_copy("silence.mp3", "taguar_delete_id3v1_field.mp3");
+
+    let mut id3v2 = Id3v2Tag::new();
+    id3v2.set_artist("Nils Frahm".to_string());
+    id3v2.save_to_path(&path, WriteOptions::default()).unwrap();
+
+    let mut id3v1 = Id3v1Tag::default();
+    id3v1.title = Some("Silence".to_string());
+    id3v1.artist = Some("Nils Frahm".to_string());
+    id3v1.save_to_path(&path, WriteOptions::default()).unwrap();
+
+    let target = dump_metadata_rows(&path)
+      .into_iter()
+      .find_map(|row| match row.target {
+        Some(target)
+          if target.tag_type == TagType::Id3v1 && row.key == "Artist" =>
+        {
+          Some(target)
+        }
+        _ => None,
+      })
+      .expect("no ID3v1 artist row");
+    delete_metadata_field(&path, target).unwrap();
+
+    let mpeg = MpegFile::read_from(
+      &mut BufReader::new(File::open(&path).unwrap()),
+      ParseOptions::new(),
+    )
+    .unwrap();
+    assert_eq!(
+      mpeg.id3v1().and_then(|t| t.artist.clone()),
+      None,
+      "the ID3v1 artist is still there",
+    );
+    assert_eq!(
+      mpeg.id3v1().and_then(|t| t.title.clone()).as_deref(),
+      Some("Silence"),
+      "the ID3v1 title was lost",
+    );
+    assert!(mpeg.id3v2().is_some(), "the ID3v2 tag was lost");
+
+    std::fs::remove_file(&path).unwrap();
+  }
+
+  /// Deleting the last item of a tag strips the tag rather than leaving an
+  /// empty one behind.
+  #[test]
+  fn deleting_the_last_item_strips_the_tag() {
+    let path = temp_copy("silence.m4a", "taguar_delete_last_atom.m4a");
+
+    let mut ilst = Ilst::new();
+    ilst.insert(Atom::new(
+      AtomIdent::Fourcc([0xA9, b'n', b'a', b'm']),
+      AtomData::UTF8("Silence".to_string()),
+    ));
+    ilst.save_to_path(&path, WriteOptions::default()).unwrap();
+
+    delete_metadata_field(&path, target_of(&path, "©nam")).unwrap();
+
+    let sections = load_metadata_dump(&path).sections;
+    assert!(
+      !sections.iter().any(|s| s.heading.starts_with("MP4 iTunes")),
+      "the empty tag is still listed: {:?}",
+      sections.iter().map(|s| &s.heading).collect::<Vec<_>>(),
+    );
+
+    std::fs::remove_file(&path).unwrap();
+  }
+
+  /// A row that's already gone (a stale modal) reports an error instead of
+  /// deleting whatever moved into its place.
+  #[test]
+  fn deleting_a_stale_row_fails() {
+    let path = temp_copy("silence.mp3", "taguar_delete_stale.mp3");
+
+    let mut id3v2 = Id3v2Tag::new();
+    id3v2.set_title("Silence".to_string());
+    id3v2.save_to_path(&path, WriteOptions::default()).unwrap();
+
+    let target = target_of(&path, "TIT2");
+    delete_metadata_field(&path, target).unwrap();
+    let err = delete_metadata_field(&path, target).unwrap_err();
+    assert!(!err.is_empty());
 
     std::fs::remove_file(&path).unwrap();
   }
