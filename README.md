@@ -63,6 +63,19 @@ taguar --help                 # print usage
 ```
 
 
+## Configuration
+
+Settings are stored in `$XDG_CONFIG_HOME/taguar/config.yaml`
+(`~/.config/taguar/config.yaml` by default, `%APPDATA%\taguar` on Windows).
+
+- `tag_padding` (default `1024`):
+  Bytes of padding reserved when writing tags,
+  so later edits can be done in place instead of rewriting the whole file.
+  For FLAC, space freed by removed or shrunk metadata is kept as padding.
+  Set to `0` to have removed metadata deleted for real,
+  at the cost of rewriting the file on every edit.
+  MP4 files are the exception: removed metadata always stays as a `free` atom.
+
 ## Format support
 
 Playback goes through rodio with `symphonia-all`, which covers MP3, FLAC,

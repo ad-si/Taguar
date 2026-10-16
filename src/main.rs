@@ -27,9 +27,8 @@ use lofty::iff::wav::{RiffInfoList, WavFile};
 use lofty::mp4::{Atom, AtomData, AtomIdent, DataType, Ilst, Mp4File};
 use lofty::mpeg::{ChannelMode, Layer, MpegFile, MpegVersion};
 use lofty::musepack::MpcFile;
-use lofty::ogg::{
-  OggPictureStorage, OpusFile, SpeexFile, VorbisComments, VorbisFile,
-};
+use lofty::ogg::tag::VorbisComments;
+use lofty::ogg::{OggPictureStorage, OpusFile, SpeexFile, VorbisFile};
 use lofty::picture::{Picture, PictureType};
 use lofty::prelude::{Accessor, AudioFile, ItemKey, TagExt};
 use lofty::tag::items::Timestamp;
@@ -44,6 +43,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, OnceLock};
 use std::thread;
 use std::time::Duration;
+use taguar::tag_io::{remove_tag, save_tag};
 use taguar::{
   apply_descriptions, apply_values, read_descriptions, read_values,
 };
@@ -298,6 +298,11 @@ struct Settings {
   /// the on-disk file is self-describing; rendering always follows
   /// [`TableColumn::ALL`] order regardless of the order here.
   visible_columns: Vec<TableColumn>,
+  /// Bytes of padding to reserve when writing a tag, so later edits can grow
+  /// or shrink it in place instead of rewriting the whole audio file. `0`
+  /// disables padding: removed tags are then deleted for real and the file
+  /// shrinks accordingly.
+  tag_padding: u32,
 }
 
 impl Default for Settings {
@@ -309,6 +314,7 @@ impl Default for Settings {
         TableColumn::Title,
         TableColumn::Comment,
       ],
+      tag_padding: WriteOptions::DEFAULT_PREFERRED_PADDING,
     }
   }
 }
@@ -1635,11 +1641,12 @@ impl Taguar {
           return Task::none();
         };
         let path = self.files[idx].path.clone();
+        let padding = self.settings.tag_padding;
         self.status = Some("Deleting field...".to_string());
         Task::perform(
           async move {
             tokio::task::spawn_blocking(move || {
-              delete_metadata_field(&path, target)
+              delete_metadata_field(&path, target, padding)
             })
             .await
             .map_err(|e| e.to_string())
@@ -2016,13 +2023,16 @@ impl Taguar {
     };
     let path = self.files[idx].path.clone();
     let form = self.form.clone();
+    let padding = self.settings.tag_padding;
     self.status = Some(status.to_string());
     Task::perform(
       async move {
-        tokio::task::spawn_blocking(move || save_tags(&path, &form, pic_change))
-          .await
-          .map_err(|e| e.to_string())
-          .and_then(|r| r)
+        tokio::task::spawn_blocking(move || {
+          save_tags(&path, &form, pic_change, padding)
+        })
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|r| r)
       },
       Message::Saved,
     )
@@ -5136,6 +5146,7 @@ fn save_tags(
   path: &Path,
   form: &TagForm,
   pic_change: PictureChange,
+  padding: u32,
 ) -> Result<(), String> {
   // Normalize away surrounding whitespace before writing (and before the
   // round-trip check in `verify_saved`, which receives this same `form`).
@@ -5245,16 +5256,18 @@ fn save_tags(
     }
     set_id3v2_user_url(&mut id3v2, "AUDIO_SOURCE", &audio_source);
     set_id3v2_descriptions(&mut id3v2, &form.descriptions);
-    id3v2
-      .save_to_path(path, WriteOptions::default())
-      .map_err(|e| format!("write tags: {e}"))?;
+    save_tag(&id3v2, path, padding).map_err(|e| format!("write tags: {e}"))?;
   }
   else {
-    tag
-      .save_to_path(path, WriteOptions::default())
-      .map_err(|e| format!("write tags: {e}"))?;
+    save_tag(&tag, path, padding).map_err(|e| format!("write tags: {e}"))?;
     if tag_type == TagType::VorbisComments {
-      write_vorbis_extras(path, file_type, &date_added, &audio_source)?;
+      write_vorbis_extras(
+        path,
+        file_type,
+        &date_added,
+        &audio_source,
+        padding,
+      )?;
     }
   }
 
@@ -5524,14 +5537,14 @@ fn write_vorbis_extras(
   file_type: FileType,
   date_added: &str,
   audio_source: &str,
+  padding: u32,
 ) -> Result<(), String> {
   let Some(mut vc) = read_vorbis_comments(path, file_type) else {
     return Ok(());
   };
   set_vorbis_field(&mut vc, "DATE_ADDED", date_added);
   set_vorbis_field(&mut vc, "AUDIO_SOURCE", audio_source);
-  vc.save_to_path(path, WriteOptions::default())
-    .map_err(|e| format!("write extras: {e}"))
+  save_tag(&vc, path, padding).map_err(|e| format!("write extras: {e}"))
 }
 
 fn set_vorbis_field(vc: &mut VorbisComments, key: &str, value: &str) {
@@ -5544,9 +5557,8 @@ fn set_vorbis_field(vc: &mut VorbisComments, key: &str, value: &str) {
 }
 
 fn delete_id3v1_tag(path: &Path) -> Result<(), String> {
-  Tag::new(TagType::Id3v1)
-    .remove_from_path(path)
-    .map_err(|e| e.to_string())
+  // ID3v1 has a fixed size, so there's no padding to keep.
+  remove_tag(&Tag::new(TagType::Id3v1), path, 0)
 }
 
 /// One tag of a file, in the same native form the "All Metadata" modal lists
@@ -5570,6 +5582,7 @@ enum NativeTag {
 fn delete_metadata_field(
   path: &Path,
   target: FieldTarget,
+  padding: u32,
 ) -> Result<(), String> {
   let tagged_file =
     lofty::read_from_path(path).map_err(|e| format!("read file: {e}"))?;
@@ -5588,7 +5601,7 @@ fn delete_metadata_field(
     };
 
   tag.remove_index(target.index)?;
-  tag.write_to(path)
+  tag.write_to(path, padding)
 }
 
 /// Reads the `tag_type` tag of `path` in its native form, mirroring
@@ -5950,36 +5963,34 @@ impl NativeTag {
     }
   }
 
-  fn write_to(&self, path: &Path) -> Result<(), String> {
+  fn write_to(&self, path: &Path, padding: u32) -> Result<(), String> {
     match self {
-      NativeTag::Id3v2(tag) => store_tag(tag, path),
-      NativeTag::Id3v1(tag) => store_tag(tag, path),
-      NativeTag::Ape(tag) => store_tag(tag, path),
-      NativeTag::Ilst(tag) => store_tag(tag, path),
-      NativeTag::Vorbis(tag) => store_tag(tag, path),
-      NativeTag::RiffInfo(tag) => store_tag(tag, path),
-      NativeTag::AiffText(tag) => store_tag(tag, path),
-      NativeTag::Generic(tag) => store_tag(tag, path),
+      NativeTag::Id3v2(tag) => store_tag(tag, path, padding),
+      NativeTag::Id3v1(tag) => store_tag(tag, path, padding),
+      NativeTag::Ape(tag) => store_tag(tag, path, padding),
+      NativeTag::Ilst(tag) => store_tag(tag, path, padding),
+      NativeTag::Vorbis(tag) => store_tag(tag, path, padding),
+      NativeTag::RiffInfo(tag) => store_tag(tag, path, padding),
+      NativeTag::AiffText(tag) => store_tag(tag, path, padding),
+      NativeTag::Generic(tag) => store_tag(tag, path, padding),
     }
   }
 }
 
 /// Writes `tag` back to `path`, stripping it outright once its last item is
-/// gone so no empty tag is left behind.
-fn store_tag<T>(tag: &T, path: &Path) -> Result<(), String>
-where
-  T: TagExt,
-  T::Err: std::fmt::Display,
-{
+/// gone so no empty tag is left behind. Where the format supports it (e.g.
+/// FLAC), the freed space is kept as padding so the audio data doesn't have
+/// to be moved.
+fn store_tag<T: TagExt>(
+  tag: &T,
+  path: &Path,
+  padding: u32,
+) -> Result<(), String> {
   if tag.is_empty() {
-    tag
-      .remove_from_path(path)
-      .map_err(|e| format!("remove tag: {e}"))
+    remove_tag(tag, path, padding).map_err(|e| format!("remove tag: {e}"))
   }
   else {
-    tag
-      .save_to_path(path, WriteOptions::default())
-      .map_err(|e| format!("write tag: {e}"))
+    save_tag(tag, path, padding).map_err(|e| format!("write tag: {e}"))
   }
 }
 
@@ -6700,7 +6711,12 @@ mod tests {
     )));
     id3v2.save_to_path(&path, WriteOptions::default()).unwrap();
 
-    delete_metadata_field(&path, target_of(&path, "TPE1")).unwrap();
+    delete_metadata_field(
+      &path,
+      target_of(&path, "TPE1"),
+      WriteOptions::DEFAULT_PREFERRED_PADDING,
+    )
+    .unwrap();
 
     let rows = dump_rows(&path);
     assert!(
@@ -6737,7 +6753,12 @@ mod tests {
     }
     id3v2.save_to_path(&path, WriteOptions::default()).unwrap();
 
-    delete_metadata_field(&path, target_of(&path, "TXXX:DATE_ADDED")).unwrap();
+    delete_metadata_field(
+      &path,
+      target_of(&path, "TXXX:DATE_ADDED"),
+      WriteOptions::DEFAULT_PREFERRED_PADDING,
+    )
+    .unwrap();
 
     let keys = keys_of(&path);
     assert!(
@@ -6769,7 +6790,12 @@ mod tests {
     ));
     ilst.save_to_path(&path, WriteOptions::default()).unwrap();
 
-    delete_metadata_field(&path, target_of(&path, "apID")).unwrap();
+    delete_metadata_field(
+      &path,
+      target_of(&path, "apID"),
+      WriteOptions::DEFAULT_PREFERRED_PADDING,
+    )
+    .unwrap();
 
     let rows = dump_rows(&path);
     assert!(
@@ -6805,7 +6831,12 @@ mod tests {
     .unwrap();
     vc.save_to_path(&path, WriteOptions::default()).unwrap();
 
-    delete_metadata_field(&path, target_of(&path, "TITLE")).unwrap();
+    delete_metadata_field(
+      &path,
+      target_of(&path, "TITLE"),
+      WriteOptions::DEFAULT_PREFERRED_PADDING,
+    )
+    .unwrap();
 
     let rows = dump_rows(&path);
     assert!(
@@ -6823,7 +6854,12 @@ mod tests {
 
     // Deleting the last comment still leaves the picture alone, rather than
     // stripping the tag it's written through.
-    delete_metadata_field(&path, target_of(&path, "MY_CUSTOM_FIELD")).unwrap();
+    delete_metadata_field(
+      &path,
+      target_of(&path, "MY_CUSTOM_FIELD"),
+      WriteOptions::DEFAULT_PREFERRED_PADDING,
+    )
+    .unwrap();
     let keys = keys_of(&path);
     assert!(
       keys.contains(&"Picture #1".to_string()),
@@ -6853,7 +6889,12 @@ mod tests {
     .unwrap();
     vc.save_to_path(&path, WriteOptions::default()).unwrap();
 
-    delete_metadata_field(&path, target_of(&path, "Picture #1")).unwrap();
+    delete_metadata_field(
+      &path,
+      target_of(&path, "Picture #1"),
+      WriteOptions::DEFAULT_PREFERRED_PADDING,
+    )
+    .unwrap();
 
     let rows = dump_rows(&path);
     assert!(
@@ -6894,7 +6935,12 @@ mod tests {
         _ => None,
       })
       .expect("no ID3v1 artist row");
-    delete_metadata_field(&path, target).unwrap();
+    delete_metadata_field(
+      &path,
+      target,
+      WriteOptions::DEFAULT_PREFERRED_PADDING,
+    )
+    .unwrap();
 
     let mpeg = MpegFile::read_from(
       &mut BufReader::new(File::open(&path).unwrap()),
@@ -6929,7 +6975,12 @@ mod tests {
     ));
     ilst.save_to_path(&path, WriteOptions::default()).unwrap();
 
-    delete_metadata_field(&path, target_of(&path, "©nam")).unwrap();
+    delete_metadata_field(
+      &path,
+      target_of(&path, "©nam"),
+      WriteOptions::DEFAULT_PREFERRED_PADDING,
+    )
+    .unwrap();
 
     let sections = load_metadata_dump(&path).sections;
     assert!(
@@ -6952,8 +7003,18 @@ mod tests {
     id3v2.save_to_path(&path, WriteOptions::default()).unwrap();
 
     let target = target_of(&path, "TIT2");
-    delete_metadata_field(&path, target).unwrap();
-    let err = delete_metadata_field(&path, target).unwrap_err();
+    delete_metadata_field(
+      &path,
+      target,
+      WriteOptions::DEFAULT_PREFERRED_PADDING,
+    )
+    .unwrap();
+    let err = delete_metadata_field(
+      &path,
+      target,
+      WriteOptions::DEFAULT_PREFERRED_PADDING,
+    )
+    .unwrap_err();
     assert!(!err.is_empty());
 
     std::fs::remove_file(&path).unwrap();

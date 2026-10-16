@@ -10,7 +10,7 @@ categories = ["multimedia::audio"]
 
 [dependencies]
 iced = { version = "0.14", features = ["tokio", "image", "svg", "advanced"] }
-lofty = "0.24"
+lofty = "0.25"
 rfd = "0.17"
 walkdir = "2.5"
 tokio = { version = "1", features = ["rt-multi-thread"] }

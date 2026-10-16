@@ -1,8 +1,10 @@
 use lofty::config::WriteOptions;
 use lofty::file::{TaggedFile, TaggedFileExt};
-use lofty::prelude::{ItemKey, TagExt};
+use lofty::prelude::ItemKey;
 use lofty::tag::{ItemValue, Tag, TagItem, TagType};
 use std::path::Path;
+
+pub mod tag_io;
 
 /// Returns the tag edits should go to: the tag matching the file's primary
 /// tag type when present, else the first non-ID3v1 tag. Preferring the
@@ -95,9 +97,7 @@ pub fn write_descriptions_to_path(
     None => Tag::new(tagged.primary_tag_type()),
   };
   apply_descriptions(&mut tag, descriptions);
-  tag
-    .save_to_path(path, WriteOptions::default())
-    .map_err(|e| e.to_string())
+  tag_io::save_tag(&tag, path, WriteOptions::DEFAULT_PREFERRED_PADDING)
 }
 
 /// Reads every value for `key` from the file's primary tag (excluding ID3v1).
@@ -129,9 +129,7 @@ pub fn write_values_to_path(
     None => Tag::new(tagged.primary_tag_type()),
   };
   apply_values(&mut tag, key, values);
-  tag
-    .save_to_path(path, WriteOptions::default())
-    .map_err(|e| e.to_string())
+  tag_io::save_tag(&tag, path, WriteOptions::DEFAULT_PREFERRED_PADDING)
 }
 
 #[cfg(test)]
