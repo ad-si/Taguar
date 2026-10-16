@@ -4175,7 +4175,9 @@ fn generic_tag_sections(
   tagged_file: &lofty::file::TaggedFile,
 ) -> Vec<MetadataSection> {
   let mut sections = Vec::new();
-  for tag in tagged_file.tags() {
+  // Skips empty tags, like the empty `ilst` that removing the last MP4 item
+  // leaves behind.
+  for tag in tagged_file.tags().iter().filter(|tag| !tag.is_empty()) {
     let mut rows: Vec<(String, String)> = tag
       .items()
       .map(|item| {
@@ -4308,7 +4310,9 @@ fn load_native_metadata(path: &Path, file_type: FileType) -> NativeMetadata {
       if p.is_drm_protected() {
         props.push(prop_row("DRM Protected", "true"));
       }
-      if let Some(t) = f.ilst() {
+      // Removing the last item leaves an empty `ilst` behind (see
+      // `taguar::tag_io`), which isn't worth listing.
+      if let Some(t) = f.ilst().filter(|t| !t.is_empty()) {
         sections.push(tag_section(TagType::Mp4Ilst, ilst_rows(t)));
       }
     }

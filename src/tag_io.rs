@@ -9,6 +9,11 @@
 //! padding if it fits, otherwise the header grows by the preferred padding of
 //! the `padding` argument (`0` meaning none, i.e. the file shrinks for
 //! real when metadata is removed).
+//!
+//! MP4 writes go through [`mp4`] to work around a lofty bug that destroys
+//! the `hdlr` atom.
+
+mod mp4;
 
 use lofty::config::WriteOptions;
 use lofty::error::FileEncodingError;
@@ -40,6 +45,9 @@ pub fn save_tag<T: TagExt>(
         return Ok(());
       }
     }
+    // lofty would strip the `ilst` atom.
+    TagType::Mp4Ilst if tag.is_empty() => return mp4::clear_ilst(path),
+    TagType::Mp4Ilst => mp4::prepare_ilst_write(path)?,
     _ => {}
   }
   tag
@@ -63,6 +71,7 @@ pub fn remove_tag<T: TagExt>(
         return Ok(());
       }
     }
+    TagType::Mp4Ilst => return mp4::clear_ilst(path),
     _ => {}
   }
   // lofty 0.25's `remove_from_path` opens the file read-only, so every

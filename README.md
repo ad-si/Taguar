@@ -76,6 +76,7 @@ Settings are stored in `$XDG_CONFIG_HOME/taguar/config.yaml`
   at the cost of rewriting the file on every edit.
   MP4 files are the exception: removed metadata always stays as a `free` atom.
 
+
 ## Format support
 
 Playback goes through rodio with `symphonia-all`, which covers MP3, FLAC,
